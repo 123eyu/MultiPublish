@@ -1113,7 +1113,9 @@ export class BrowserManager {
         // Toutiao replaces the form after video processing completes. Re-apply
         // the title after that rerender so the final publish request does not
         // restore the original over-30-character draft title.
-        await this.fillContent(wc, draft, "toutiao");
+        await this.fillContent(wc, draft, "toutiao", {
+          toutiaoStrict: true,
+        });
       }
       if (
         draft.coverPath &&
@@ -2812,6 +2814,7 @@ export class BrowserManager {
     wc: Electron.WebContents,
     draft: PublishDraft,
     platform: Account["platform"],
+    options: { toutiaoStrict?: boolean } = {},
   ) {
     if (platform === "bilibili" || platform === "kuaishou") await sleep(3000);
     const titleLimit =
@@ -3068,22 +3071,87 @@ export class BrowserManager {
         });
         await sleep(700);
       }
-      const titleState = await wc
-        .executeJavaScript(
-          "((value)=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;const inputs=[...document.querySelectorAll('input')].filter(e=>visible(e)&&/0[～-]30|标题/.test(e.placeholder||''));for(const e of inputs){e.focus();setter?setter.call(e,value):e.value=value;e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));e.blur?.()}return{values:inputs.map(e=>e.value),placeholders:inputs.map(e=>e.placeholder),value:inputs.at(-1)?.value||'',placeholder:inputs.at(-1)?.placeholder||''}})(" +
-            JSON.stringify(title) +
-            ")",
-        )
-        .catch(() => ({ value: "", placeholder: "" }));
+      // The form re-renders while the video uploads, so the verify query can
+      // race a remount and momentarily see zero inputs even though the typed
+      // title persists. The editor can also live in a child iframe, where the
+      // main document query finds nothing, so poll every frame before
+      // declaring the input ineffective.
+      const titleQuery =
+        "((value)=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const hint=e=>(e.placeholder||'')+(e.getAttribute('data-placeholder')||'');const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;const inputs=all(document).filter(e=>visible(e)&&e.matches?.('input')&&/[0-9][～-]30|标题/.test(hint(e)));for(const e of inputs){e.focus();setter?setter.call(e,value):e.value=value;e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));e.blur?.()}return{values:inputs.map(e=>e.value),placeholders:inputs.map(e=>hint(e)),value:inputs.at(-1)?.value||'',placeholder:inputs.at(-1)?hint(inputs.at(-1))||inputs.at(-1).placeholder||'':''}})(" +
+        JSON.stringify(title) +
+        ")";
+      let titleState: { value: string; placeholder: string } = {
+        value: "",
+        placeholder: "",
+      };
+      const frames = [wc.mainFrame, ...wc.mainFrame.framesInSubtree];
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const frameStates: Array<{
+          url: string;
+          value: string;
+          placeholder: string;
+        }> = await Promise.all(
+          frames.map((frame) =>
+            frame
+              .executeJavaScript(titleQuery)
+              .then((raw) => {
+                const state = raw as { value: string; placeholder: string };
+                return {
+                  url: frame.url,
+                  value: state.value,
+                  placeholder: state.placeholder,
+                };
+              })
+              .catch(() => ({ url: frame.url, value: "", placeholder: "" })),
+          ),
+        );
+        const matched = frameStates.find((state) => state.value === title);
+        if (matched) {
+          titleState = {
+            value: matched.value,
+            placeholder: matched.placeholder,
+          };
+          break;
+        }
+        titleState = {
+          value: frameStates.at(-1)?.value || "",
+          placeholder: frameStates.at(-1)?.placeholder || "",
+        };
+        await sleep(1200);
+      }
+      const inputInventoryQuery =
+        "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};return{url:location.href,inputs:all(document).filter(e=>visible(e)&&e.matches?.('input,textarea,[contenteditable=true]')).slice(0,30).map(e=>({tag:e.tagName,type:e.type||'',placeholder:e.placeholder||'',dataPlaceholder:e.getAttribute('data-placeholder')||'',aria:e.getAttribute('aria-label')||'',cls:String(e.className||'').slice(0,80),value:typeof e.value==='string'?e.value.slice(0,60):(e.textContent||'').slice(0,60)}))}})()";
+      const frameInventories = await Promise.all(
+        frames.map((frame) =>
+          frame
+            .executeJavaScript(inputInventoryQuery)
+            .catch(() => ({ url: frame.url, inputs: [] })),
+        ),
+      );
       await writeBrowserLog(
         "toutiao-content-typed " +
-          JSON.stringify({ genericFilled, titleState, expectedTitle: title }),
+          JSON.stringify({
+            genericFilled,
+            titleState,
+            expectedTitle: title,
+            frameCount: frames.length,
+            inventories: frameInventories,
+          }).slice(0, 16000),
       );
-      if (titleState.value !== title)
-        throw new Error(
-          "头条标题输入未生效：" +
+      if (titleState.value !== title) {
+        if (options.toutiaoStrict)
+          throw new Error(
+            "头条标题输入未生效：" +
+              JSON.stringify({ titleState, expectedTitle: title }),
+          );
+        // The first fill runs while the video is still uploading; Toutiao
+        // resets the form (title from filename) once processing completes,
+        // so only the strict post-upload re-fill may abort the task here.
+        await writeBrowserLog(
+          "toutiao-title-lenient-mismatch " +
             JSON.stringify({ titleState, expectedTitle: title }),
         );
+      }
     }
   }
   private async waitForBilibiliPublishReady(

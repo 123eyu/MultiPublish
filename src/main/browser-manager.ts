@@ -1613,7 +1613,7 @@ export class BrowserManager {
             : account.platform === "douyin"
               ? 600000
               : account.platform === "toutiao"
-                ? 30000
+                ? 120000
                 : 120000,
       );
       if (result.challenge)
@@ -1644,6 +1644,27 @@ export class BrowserManager {
             (verified.reason || "平台后台未找到目标作品") +
             (evidence ? "；现场截图：" + evidence : ""),
         };
+      }
+      if (clicked) {
+        // The submit click was issued but the platform gave neither a success
+        // URL nor a success banner inside the wait window (e.g. Toutiao
+        // redirects to its manage page tens of seconds after the click).
+        // Settle the outcome by checking the creator backend for the target
+        // title instead of bouncing the task straight to manual_required.
+        const lateVerified = await this.verifyPublishedTitle(
+          wc,
+          account.platform,
+          draft.title,
+          180000,
+        );
+        if (lateVerified.ok)
+          return {
+            status: "success" as const,
+            message:
+              platformMap[account.platform].name +
+              "作品管理已找到目标标题，发布成功：" +
+              lateVerified.url,
+          };
       }
       const diagnostics =
         account.platform === "xiaohongshu"
@@ -3500,7 +3521,9 @@ export class BrowserManager {
         };
       if (
         state.success &&
-        (platform === "xiaohongshu" || platform === "bilibili")
+        (platform === "xiaohongshu" ||
+          platform === "bilibili" ||
+          platform === "toutiao")
       )
         return {
           success: true,

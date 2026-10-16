@@ -590,20 +590,28 @@ export class BrowserManager {
       );
       if (!editorReady) throw new Error("视频已选择，但未进入平台编辑页面");
       if (account.platform === "bilibili") {
-        const uploadStart = Date.now();
+        const uploadDeadline = Date.now() + 240000;
         let uploadFinished = false;
-        while (Date.now() - uploadStart < 30000) {
+        while (Date.now() < uploadDeadline) {
           const uploadState = await wc.executeJavaScript(
-            "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const fields=[...document.querySelectorAll('input,textarea,[contenteditable=true]')].filter(visible);const title=fields.find(e=>/标题|稿件标题|视频标题/.test(e.getAttribute('placeholder')||''));const declaration=fields.find(e=>/创建声明|创作声明|自制声明/.test(e.getAttribute('placeholder')||''));const anchors=[title,declaration,fields.find(e=>/立即投稿|投稿类型/.test(e.parentElement?.innerText||''))].filter(Boolean);const root=anchors[0]?.closest('form,[class*=upload],[class*=投稿],[class*=editor]')||anchors[0]?.parentElement;const text=(root?.innerText||anchors.map(e=>e?.parentElement?.innerText||'').join('\\n')||'').slice(0,12000);const failed=/上传失败|转码失败|无视频流信息/.test(text);const editorReady=!!title||!!declaration||/立即投稿|投稿类型|自制声明|视频封面|添加标签/.test(text);const completed=!failed&&(editorReady||/上传完成|已上传|视频预览/.test(text));const uploading=!completed&&/上传中|剩余时间|当前速度|上传进度/.test(text);return{completed,uploading,failed,text}})()",
+            "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const fields=[...document.querySelectorAll('input,textarea,[contenteditable=true]')].filter(visible);const title=fields.find(e=>/标题|稿件标题|视频标题/.test(e.getAttribute('placeholder')||''));const declaration=fields.find(e=>/创建声明|创作声明|自制声明/.test(e.getAttribute('placeholder')||''));const anchors=[title,declaration,fields.find(e=>/立即投稿|投稿类型/.test(e.parentElement?.innerText||''))].filter(Boolean);const root=anchors[0]?.closest('form,[class*=upload],[class*=投稿],[class*=editor]')||anchors[0]?.parentElement;const text=(root?.innerText||anchors.map(e=>e?.parentElement?.innerText||'').join('\\n')||'').slice(0,12000);const failed=/上传失败|转码失败|无视频流信息/.test(text);const editorReady=!!title||!!declaration||/立即投稿|投稿类型|自制声明|视频封面|添加标签/.test(text);const completed=!failed&&(editorReady||/上传完成|已上传|视频预览/.test(text));const uploading=!completed&&/上传中|剩余时间|当前速度|上传进度/.test(text);const landing=/点击上传或将视频拖拽到此区域/.test((document.body?.innerText||''))&&!editorReady;return{completed,uploading,failed,landing,text}})()",
           );
           if (uploadState.failed) throw new Error("B站平台返回视频上传失败");
-          // waitForEditor has already confirmed the editable form. Bilibili
-          // often leaves a stale progress label in the DOM after completion.
-          if (uploadState.completed || !uploadState.uploading) {
+          // Only positive completion evidence counts. The old
+          // `!uploading → completed` shortcut mistook an upload that never
+          // started (or was silently dropped back to the landing page) for a
+          // finished upload and marched on to a guaranteed timeout.
+          if (uploadState.completed) {
             uploadFinished = true;
             break;
           }
-          await sleep(1500);
+          if (uploadState.landing) {
+            // The page fell back to the video-select screen after the file
+            // injection; re-drive the upload instead of timing out later.
+            await writeBrowserLog("bilibili-upload-landing-retry");
+            await this.uploadBilibiliVideo(wc, draft.mediaPaths[0]);
+          }
+          await sleep(2000);
         }
         if (!uploadFinished)
           throw new Error("B站视频上传未在等待时间内完成，请检查平台处理状态");
@@ -2511,6 +2519,34 @@ export class BrowserManager {
     }
     return undefined;
   }
+  // After DOM.setFileInputFiles the platform may silently drop the upload and
+  // fall back to the video-select landing page. Confirm the upload really
+  // started (progress text, editor form, or a rendered video) before trusting
+  // the file injection.
+  private async waitForBilibiliUploadStart(
+    wc: Electron.WebContents,
+    timeout: number,
+  ) {
+    const start = Date.now();
+    let evidence = "";
+    while (Date.now() - start < timeout) {
+      const state = await wc
+        .executeJavaScript(
+          "(()=>{const text=document.body?.innerText||'';const visible=e=>!!e&&e.offsetParent!==null;return{uploading:/上传中|正在上传|剩余时间|上传速度|上传进度|正在转码|转码中|上传完成|秒传|上传成功|视频预览/.test(text),editor:/稿件标题|立即投稿|投稿类型|添加标签/.test(text)||[...document.querySelectorAll('input,textarea')].some(e=>visible(e)&&/标题|稿件标题|视频标题/.test(e.placeholder||'')),video:[...document.querySelectorAll('video')].some(visible),landing:/点击上传或将视频拖拽到此区域/.test(text)}})()",
+        )
+        .catch(() => ({
+          uploading: false,
+          editor: false,
+          video: false,
+          landing: true,
+        }));
+      evidence = JSON.stringify(state).slice(0, 2000);
+      if (state.uploading || state.editor || state.video)
+        return { started: true, evidence };
+      await sleep(1500);
+    }
+    return { started: false, evidence };
+  }
   private async uploadBilibiliVideo(wc: Electron.WebContents, file: string) {
     if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
     await wc.debugger.sendCommand("Page.enable").catch(() => undefined);
@@ -2524,34 +2560,54 @@ export class BrowserManager {
       enabled: true,
     });
     try {
-      const clicked = await this.clickButtonByText(
-        wc,
-        ["上传视频", "点击上传视频", "选择视频", "点击上传", "上传文件", "选择文件"],
-        false,
-        true,
-      );
-      if (!clicked) {
-        const fallbackClicked = await wc
-          .executeJavaScript(
-            "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const nodes=all(document).filter(visible);const target=nodes.filter(e=>/上传|选择|拖拽/.test((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||''))&&/视频|文件|video|upload/i.test((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||'')+' '+String(e.className||''))).sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height})[0];if(!target)return false;target.click();return true})()",
-          )
-          .catch(() => false);
-        if (!fallbackClicked)
-          throw new Error("Bilibili current upload button not found");
-      }
-      const chooserStart = Date.now();
-      while (Date.now() - chooserStart < 30000) {
-        if (chooserNodeId) {
-          await this.setFileInput(wc, chooserNodeId, [file]);
-          return chooserNodeId;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        chooserNodeId = undefined;
+        const clicked = await this.clickButtonByText(
+          wc,
+          ["上传视频", "点击上传视频", "选择视频", "点击上传", "上传文件", "选择文件"],
+          false,
+          true,
+        );
+        let fallbackClicked = false;
+        if (!clicked) {
+          fallbackClicked = await wc
+            .executeJavaScript(
+              "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const nodes=all(document).filter(visible);const target=nodes.filter(e=>/上传|选择|拖拽/.test((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||''))&&/视频|文件|video|upload/i.test((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||'')+' '+String(e.className||''))).sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height})[0];if(!target)return false;target.click();return true})()",
+            )
+            .catch(() => false);
+          if (!fallbackClicked)
+            throw new Error("Bilibili current upload button not found");
         }
-        await sleep(200);
+        let inputNodeId = 0;
+        const chooserStart = Date.now();
+        while (Date.now() - chooserStart < 15000) {
+          if (chooserNodeId) {
+            inputNodeId = chooserNodeId;
+            break;
+          }
+          await sleep(200);
+        }
+        if (!inputNodeId) {
+          const currentInput = await this.waitForBilibiliVideoInput(wc, 10000);
+          if (currentInput) inputNodeId = currentInput.nodeId;
+        }
+        if (!inputNodeId)
+          throw new Error("Bilibili current video upload control not found");
+        await this.setFileInput(wc, inputNodeId, [file]);
+        const uploadStart = await this.waitForBilibiliUploadStart(wc, 25000);
+        await writeBrowserLog(
+          "bilibili-upload-attempt " +
+            JSON.stringify({
+              attempt,
+              clicked,
+              fallbackClicked,
+              usedChooser: chooserNodeId !== undefined,
+              ...uploadStart,
+            }).slice(0, 4000),
+        );
+        if (uploadStart.started) return inputNodeId;
       }
-      const currentInput = await this.waitForBilibiliVideoInput(wc, 15000);
-      if (!currentInput)
-        throw new Error("Bilibili current video upload control not found");
-      await this.setFileInput(wc, currentInput.nodeId, [file]);
-      return currentInput.nodeId;
+      throw new Error("B站视频上传未开始（已重试 3 次），请检查视频格式与大小");
     } finally {
       wc.debugger.removeListener("message", listener);
       await wc.debugger

@@ -1149,48 +1149,79 @@ export class BrowserManager {
             2500,
             [videoNodeId],
           );
+          let confirmedViaFrame = false;
           if (!localCoverInput) {
-            const localUploadOpened = await this.clickButtonByText(
+            // The editor opens on 封面截取 with a default video frame already
+            // selected. Confirming that frame satisfies the required cover
+            // without any file upload, so prefer it over hunting for a
+            // local-upload file control the dialog may not expose.
+            const frameNext = await this.clickButtonByText(
               wc,
-              ["本地上传", "本地上传图片", "上传图片", "从本地选择", "选择本地图片"],
-              false,
-              false,
+              ["下一步"],
+              true,
+              true,
             );
-            if (!localUploadOpened) {
-              const semanticOpened = await wc
-                .executeJavaScript(
-                  "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const nodes=all(document).filter(visible);const target=nodes.filter(e=>{const s=((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||'')).trim();return /本地|图片|上传|选择/.test(s)&&e.children.length<8}).sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height})[0];if(!target)return false;target.click();return true})()",
-                )
-                .catch(() => false);
-              if (!semanticOpened)
-                throw new Error("未找到头条本地上传封面页签");
+            await writeBrowserLog(
+              "toutiao-cover-frame-next " + String(frameNext),
+            );
+            if (frameNext) {
+              confirmedViaFrame = true;
+            } else {
+              const localUploadOpened = await this.clickButtonByText(
+                wc,
+                ["本地上传", "本地上传图片", "上传图片", "从本地选择", "选择本地图片"],
+                false,
+                false,
+              );
+              if (!localUploadOpened) {
+                const semanticOpened = await wc
+                  .executeJavaScript(
+                    "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const nodes=all(document).filter(visible);const target=nodes.filter(e=>{const s=((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||'')).trim();return /本地|图片|上传|选择/.test(s)&&e.children.length<8}).sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height})[0];if(!target)return false;target.click();return true})()",
+                  )
+                  .catch(() => false);
+                if (!semanticOpened)
+                  throw new Error("未找到头条本地上传封面页签");
+              }
+              localCoverInput = await this.waitForMatchingFileInput(
+                wc,
+                "image",
+                15000,
+                [videoNodeId],
+              );
             }
-            localCoverInput = await this.waitForMatchingFileInput(
-              wc,
-              "image",
-              15000,
-              [videoNodeId],
-            );
           }
-          if (localCoverInput)
-            await this.setFileInput(wc, localCoverInput.nodeId, [
-              draft.coverPath,
-            ]);
-          else
-            await this.chooseFileFromButton(
-              wc,
-              ["本地上传", "本地上传图片", "点击上传", "上传图片", "从本地选择"],
-              draft.coverPath,
-            );
-          await sleep(1800);
-          await this.clickButtonByText(wc, ["下一步"], true, true);
-          await sleep(1000);
-          const editorConfirmed = await this.clickButtonByText(
+          if (confirmedViaFrame) {
+            await sleep(1000);
+          } else {
+            if (localCoverInput)
+              await this.setFileInput(wc, localCoverInput.nodeId, [
+                draft.coverPath,
+              ]);
+            else
+              await this.chooseFileFromButton(
+                wc,
+                ["本地上传", "本地上传图片", "点击上传", "上传图片", "从本地选择"],
+                draft.coverPath,
+              );
+            await sleep(1800);
+            await this.clickButtonByText(wc, ["下一步"], true, true);
+            await sleep(1000);
+          }
+          let editorConfirmed = await this.clickButtonByText(
             wc,
             ["裁剪完成", "完成", "确定", "保存"],
             true,
             true,
           );
+          if (!editorConfirmed && confirmedViaFrame) {
+            await sleep(1200);
+            editorConfirmed = await this.clickButtonByText(
+              wc,
+              ["完成", "确定", "保存", "裁剪完成"],
+              true,
+              true,
+            );
+          }
           if (!editorConfirmed) throw new Error("未找到头条封面编辑确认按钮");
           await sleep(1000);
           const finalConfirmVisible = await wc
@@ -1237,8 +1268,9 @@ export class BrowserManager {
             );
           }
           } catch (error) {
-            // A custom cover is optional; platform UI changes must not block
-            // an otherwise valid video submission.
+            // Toutiao marks the cover as required: submitting without one is
+            // silently rejected by the platform, so a failed cover flow must
+            // fail the task with the real reason instead of skipping ahead.
             const coverFailureState = await wc
               .executeJavaScript(
                 "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const nodes=[...document.querySelectorAll('button,[role=button],a,input,textarea,[contenteditable=true],div,span,label')].filter(visible);return JSON.stringify({url:location.href,body:(document.body?.innerText||'').slice(-12000),controls:nodes.map(e=>({tag:e.tagName,text:(e.textContent||'').trim().slice(0,300),aria:e.getAttribute('aria-label'),title:e.getAttribute('title'),placeholder:e.getAttribute('placeholder'),type:e.getAttribute('type'),disabled:!!e.disabled,cls:String(e.className||'').slice(0,200)})).filter(e=>e.text||e.aria||e.title||e.placeholder).slice(-300)})})()",
@@ -1250,6 +1282,9 @@ export class BrowserManager {
                 " state=" +
                 coverFailureState.slice(0, 16000),
             );
+            throw error instanceof Error
+              ? error
+              : new Error(String(error));
           }
         } else {
           const nearbyCover =
@@ -1589,6 +1624,17 @@ export class BrowserManager {
             false,
           );
           await writeBrowserLog("toutiao-publish-retry " + String(retry));
+          // Surface the platform validation toast (e.g. 请上传封面) so a
+          // blocked submit is diagnosable instead of a silent timeout.
+          await sleep(1500);
+          const toasts = await wc
+            .executeJavaScript(
+              "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';return [...document.querySelectorAll('div,span,p')].filter(visible).map(e=>(e.textContent||'').trim()).filter(t=>t&&t.length<80&&/请|必须|不能|失败|错误|再试/.test(t)).slice(-12)})()",
+            )
+            .catch(() => []);
+          await writeBrowserLog(
+            "toutiao-post-click-toasts " + JSON.stringify(toasts),
+          );
         }
       }
       if (

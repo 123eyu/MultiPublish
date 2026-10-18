@@ -32,6 +32,22 @@ const redactWeixinDiagnostic = (value: unknown, limit = 16000) =>
     .slice(0, limit);
 export const chromeUserAgent =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+// 小红书创作平台按访问地域分为国内站与海外站：
+// 国内用户停留在 creator.xiaohongshu.com，海外用户会被平台自动跳转到 creator.rednote.com。
+// 导航时沿用当前会话所在的域名，避免把用户强制推到另一个地域的站点。
+const XHS_ORIGIN_DOMESTIC = "https://creator.xiaohongshu.com";
+const XHS_ORIGIN_OVERSEAS = "https://creator.rednote.com";
+const XHS_PUBLISH_PATH = "/publish/publish?from=homepage&target=video";
+const xhsOriginFromUrl = (url?: string) => {
+  try {
+    const host = new URL(url || "").hostname.toLowerCase();
+    if (host === "rednote.com" || host.endsWith(".rednote.com"))
+      return XHS_ORIGIN_OVERSEAS;
+  } catch {
+    // 空 URL 或非法 URL 时按国内站处理
+  }
+  return XHS_ORIGIN_DOMESTIC;
+};
 const weixinPostListRecorder = `(()=>{try{if(window.__multipublishPostListRecorder)return true;window.__multipublishPostListRecorder=true;window.__multipublishPostListEvidence=[];const record=(url,body)=>{if(!/\\/post\\/post_list(?:\\?|$)/.test(String(url||""))||typeof body!=="string")return;try{const parsed=JSON.parse(body);const list=parsed?.data?.list;if(!Array.isArray(list))return;const titles=list.map(item=>({objectId:String(item?.objectId||"").slice(0,120),createTime:item?.createTime,titles:[item?.desc?.description,item?.desc?.mpTitle,item?.description,item?.title,...(Array.isArray(item?.desc?.shortTitle)?item.desc.shortTitle.map(value=>typeof value==="string"?value:value?.shortTitle):[])].filter(value=>typeof value==="string"&&value.trim())}));window.__multipublishPostListEvidence.push({url:String(url),titles});if(window.__multipublishPostListEvidence.length>4)window.__multipublishPostListEvidence.shift()}catch(_){}};const fetch0=window.fetch;if(typeof fetch0==="function")window.fetch=function(input,init){const url=typeof input==="string"?input:input?.url||"";return fetch0.call(this,input,init).then(response=>{if(/\\/post\\/post_list(?:\\?|$)/.test(String(url)))response.clone().text().then(body=>record(url,body)).catch(()=>{});return response})};const open0=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(method,url){this.__multipublishPostListUrl=String(url||"");return open0.apply(this,arguments)};const send0=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.send=function(body){if(/\\/post\\/post_list(?:\\?|$)/.test(this.__multipublishPostListUrl||""))this.addEventListener("load",()=>{try{record(this.__multipublishPostListUrl,this.responseText)}catch(_){}});return send0.call(this,body)};return true}catch(_){return false}})()`;
 const extractWeixinPostListTitles = (body: string) => {
   try {
@@ -71,6 +87,7 @@ export class BrowserManager {
   >();
   private weixinPostCreateRequested = new Set<number>();
   private weixinPostListTitles = new Map<number, string[]>();
+  private xhsOrigins = new Map<string, string>();
   private active?: string;
   private bounds: BrowserBounds = { x: 280, y: 160, width: 900, height: 650 };
   constructor(
@@ -79,6 +96,17 @@ export class BrowserManager {
   ) {}
   private accountSession(accountId: string) {
     return session.fromPartition("persist:account-" + accountId);
+  }
+  // 返回该账号当前所在的小红书店点：优先用最近检测到的域名，
+  // 否则回退到已打开的账号视图 URL，最后默认国内站（会由平台自动跳转）。
+  private xhsOrigin(account: Account) {
+    const detected = this.xhsOrigins.get(account.id);
+    if (detected) return detected;
+    const viewUrl = this.views.get(account.id)?.webContents.getURL();
+    return xhsOriginFromUrl(viewUrl);
+  }
+  private xhsUrl(account: Account, path: string) {
+    return this.xhsOrigin(account).replace(/\/+$/, "") + path;
   }
   private async flushAccountSession(accountId: string, reason: string) {
     const existing = this.sessionFlushes.get(accountId);
@@ -171,7 +199,14 @@ export class BrowserManager {
     );
     if (!view.webContents.getURL() || target === "publish")
       await view.webContents.loadURL(
-        target === "publish" ? p.publishUrl : p.homeUrl,
+        account.platform === "xiaohongshu"
+          ? this.xhsUrl(
+              account,
+              target === "publish" ? XHS_PUBLISH_PATH : "/",
+            )
+          : target === "publish"
+            ? p.publishUrl
+            : p.homeUrl,
       );
     await this.updateAccount(account.id, { loginStatus: "checking" });
     await sleep(1000);
@@ -252,7 +287,11 @@ export class BrowserManager {
         "正在进入" + platformMap[account.platform].name + "发布页面",
       );
       await wc
-        .loadURL(platformMap[account.platform].publishUrl)
+        .loadURL(
+          account.platform === "xiaohongshu"
+            ? this.xhsUrl(account, XHS_PUBLISH_PATH)
+            : platformMap[account.platform].publishUrl,
+        )
         .catch(async (error) => {
           const message = String(error);
           void writeBrowserLog(
@@ -3423,7 +3462,10 @@ export class BrowserManager {
       bilibili: "https://member.bilibili.com/platform/upload-manager/article",
       weixin: "https://channels.weixin.qq.com/platform/post/list",
     };
-    const managerUrl = managerUrls[platform];
+    const managerUrl =
+      platform === "xiaohongshu"
+        ? xhsOriginFromUrl(wc.getURL()) + "/"
+        : managerUrls[platform];
     if (!managerUrl)
       return {
         ok: false,
@@ -3665,6 +3707,9 @@ export class BrowserManager {
         return "";
       }
     })();
+    // 记录账号当前所在的小红书店点，后续导航沿用该域名。
+    if (account.platform === "xiaohongshu")
+      this.xhsOrigins.set(account.id, xhsOriginFromUrl(url));
     try {
       const result = await wc.executeJavaScript(
         "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const bodyText=document.body?.innerText||'';const text=bodyText.slice(0,12000);const selectors=['[class*=user-name]','[class*=username]','[class*=nickname]','[class*=account-name]','[class*=userName]','[class*=nickName]'];let name='';for(const selector of selectors){const node=[...document.querySelectorAll(selector)].find(visible);const value=node?.textContent?.trim();if(value&&value.length>1&&value.length<40){name=value;break}}const loginRoots=[...document.querySelectorAll('main#login-form,.login-box-container,[class*=login-box],[class*=login-container],[class*=qrcode],[class*=qr-code]')].filter(visible);const visibleLogin=loginRoots.length>0||[...document.querySelectorAll('img[alt*=qrcode i],img[src*=qrcode i]')].some(visible);const loginText=/扫码登录|手机号登录|验证码登录|QQ登录|微信登录|APP扫一扫登录/.test(text);return{name,visibleLogin,loginText,text}})()",
@@ -3686,7 +3731,10 @@ export class BrowserManager {
           !result.visibleLogin &&
           !result.loginText;
       if (account.platform === "xiaohongshu")
-        loggedIn = host === "creator.xiaohongshu.com" && !result.visibleLogin;
+        loggedIn =
+          (host === "creator.xiaohongshu.com" ||
+            host === "creator.rednote.com") &&
+          !result.visibleLogin;
       if (account.platform === "weixin")
         loggedIn = (() => {
           const pathname = (() => {
@@ -3830,7 +3878,11 @@ export class BrowserManager {
     if (action === "forward" && wc.canGoForward()) wc.goForward();
     if (action === "reload") wc.reload();
     if (action === "home" && account)
-      wc.loadURL(platformMap[account.platform].homeUrl);
+      wc.loadURL(
+        account.platform === "xiaohongshu"
+          ? this.xhsUrl(account, "/")
+          : platformMap[account.platform].homeUrl,
+      );
   }
   async remove(id: string) {
     await this.close(id);

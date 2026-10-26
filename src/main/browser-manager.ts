@@ -2903,116 +2903,100 @@ export class BrowserManager {
   }
   /**
    * 在页面上按文本定位一个复选/开关控件并确保其被勾选。
-   * patterns 按优先级排列（如 声明原创 → 原创声明 → 原创），逐个尝试：
-   * CDP 展平文档（穿透 Shadow DOM）→ 匹配短文本节点 → 沿祖先链向上找
-   * 可见且含 input[type=checkbox] 的容器 → 未勾选则点击；无原生 input 时
-   * 回退点击可见且形似开关的小尺寸容器。
-   * 全程容错：找不到目标只写日志不抛错；每次尝试都记录控件身份
-   * （命中文本、label 文本、input HTML、可见性），便于事后判定勾对与否。
+   *
+   * 关键实现要点（2026-10-26 取证驱动）：
+   * 1) 抖音/小红书发布页是微前端，声明控件可能位于 iframe 内，只查主
+   *    frame 会全部落空（v0.1.29 抖音"原创/头条/番茄/懂车帝"四个目标
+   *    全是 no-visible-control），因此逐 frame 扫描。
+   * 2) 点击后必须复验状态（before/after），"点了"不等于"生效"。
+   * 3) 日志记录控件身份（label 文本/HTML 片段/控件类型），才能证明勾中
+   *    的是"声明原创"而不是页面上别的复选框。
    */
   private async ensureCheckboxByText(
     wc: Electron.WebContents,
     patterns: RegExp[],
     logTag: string,
   ): Promise<void> {
-    try {
-      if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
-      await cdpWithTimeout(
-        wc.debugger.sendCommand("DOM.enable"),
-        10000,
-        "declare-original-dom-enable",
-      );
-      const flat = (await cdpWithTimeout(
-        wc.debugger.sendCommand("DOM.getFlattenedDocument", {
-          depth: -1,
-          pierce: true,
-        }),
-        15000,
-        "declare-original-flattened-document",
-      )) as
-        | {
-            nodes: Array<{
-              nodeId: number;
-              parentId?: number;
-              nodeName: string;
-              nodeValue?: string;
-              backendNodeId?: number;
-            }>;
+    const frames = [wc.mainFrame, ...wc.mainFrame.framesInSubtree];
+    const attempts: Array<Record<string, unknown>> = [];
+    for (const frame of frames) {
+      const script = `(()=>{
+        const visible=el=>!!el&&!!el.getClientRects&&el.getClientRects().length>0;
+        const patterns=${JSON.stringify(patterns.map((p) => p.source))}.map(s=>new RegExp(s));
+        const expanders=[...document.querySelectorAll('button,div,span,label,a')]
+          .filter(e=>visible(e)&&/^(更多设置|更多选项|高级设置|作品声明|同步发布|同步到|全部设置)$/.test((e.textContent||'').trim()))
+          .slice(0,4);
+        for(const ex of expanders){try{(ex.closest('button')||ex).click()}catch{}}
+        const stateOf=el=>{
+          if(!el)return null;
+          if(el.checked!==undefined)return !!el.checked;
+          const aria=el.getAttribute&&el.getAttribute('aria-checked');
+          if(aria==='true'||aria==='false')return aria==='true';
+          const cls=String(el.className||'');
+          if(/checked|is-checked|active|selected/.test(cls))return true;
+          return null;
+        };
+        const findControl=root=>{
+          let scope=root;
+          for(let i=0;i<5&&scope;i++){
+            const c=scope.querySelector&&scope.querySelector('input[type=checkbox],input[type=radio],[role=switch],[role=checkbox],[class*=switch],[class*=checkbox],[class*=toggle]');
+            if(c)return c;
+            scope=scope.parentElement;
           }
+          return null;
+        };
+        const texts=[...document.querySelectorAll('*')].filter(e=>{
+          if(e.children&&e.children.length)return false;
+          const t=(e.textContent||'').trim();
+          return t&&t.length<=40&&patterns.some(p=>p.test(t));
+        });
+        for(const t of texts){
+          const label=(t.textContent||'').trim();
+          let root=t;
+          for(let i=0;i<4&&root;i++){
+            const control=findControl(root);
+            if(control){
+              const before=stateOf(control);
+              if(before===false){
+                try{(control.closest('label')||control).click()}catch{}
+                const after=stateOf(control);
+                return{ok:true,kind:'control',before,after,label,controlTag:control.tagName,controlCls:String(control.className||'').slice(0,120),html:(control.outerHTML||'').slice(0,300),scopeText:(root.innerText||root.textContent||'').trim().slice(0,120),rect:(()=>{const r=root.getBoundingClientRect();return{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}})()};
+              }
+              return{ok:true,kind:'control',before,after:before,label,controlTag:control.tagName,controlCls:String(control.className||'').slice(0,120),html:(control.outerHTML||'').slice(0,300),scopeText:(root.innerText||root.textContent||'').trim().slice(0,120),rect:(()=>{const r=root.getBoundingClientRect();return{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}})()};
+            }
+            const cls=String(root.className||'');
+            const aria=root.getAttribute&&root.getAttribute('aria-checked');
+            const looksSwitch=/switch|checkbox|toggle|check/i.test(cls)||aria!==null;
+            const r=root.getBoundingClientRect();
+            if(looksSwitch&&r.width>0&&r.width<420&&r.height<90&&visible(root)){
+              const before=stateOf(root);
+              if(before===false){try{root.click()}catch{}}
+              return{ok:true,kind:'switch',before,after:stateOf(root),label,controlTag:root.tagName,controlCls:cls.slice(0,120),html:(root.outerHTML||'').slice(0,300),scopeText:(root.innerText||root.textContent||'').trim().slice(0,120),rect:{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}};
+            }
+            root=root.parentElement;
+          }
+        }
+        return{ok:false};
+      })()`;
+      const result = (await frame
+        .executeJavaScript(script)
+        .catch(() => undefined)) as
+        | ({ ok: boolean } & Record<string, unknown>)
         | undefined;
-      if (!flat) {
-        await writeBrowserLog(logTag + " flattened-document-timeout");
-        return;
-      }
-      const byId = new Map(flat.nodes.map((node) => [node.nodeId, node]));
-      const shortTexts = flat.nodes.filter(
-        (node) =>
-          node.nodeName === "#text" &&
-          node.nodeValue &&
-          node.nodeValue.trim().length <= 24,
-      );
-      const attempts: Array<Record<string, unknown>> = [];
-      const visited = new Set<number>();
-      // 第一轮找不到可见控件时，尝试展开"更多设置/更多选项"后再扫一次：
-      // 平台的原创声明常折叠在高级选项里。
-      for (let pass = 0; pass < 2; pass++) {
-        for (const pattern of patterns) {
-          for (const textNode of shortTexts) {
-            if (visited.has(textNode.nodeId)) continue;
-            if (!pattern.test(textNode.nodeValue!)) continue;
-            visited.add(textNode.nodeId);
-            const ancestors: number[] = [];
-            let current: typeof textNode | undefined = textNode;
-            for (let level = 0; level < 6 && current?.parentId; level++) {
-              current = byId.get(current.parentId);
-              if (!current || !current.backendNodeId) break;
-              ancestors.push(current.backendNodeId);
-            }
-            for (const backendNodeId of ancestors) {
-              const resolved = await wc.debugger.sendCommand("DOM.resolveNode", {
-                backendNodeId,
-              });
-              const objectId = resolved.object?.objectId;
-              if (!objectId) continue;
-              const invocation = (await wc.debugger.sendCommand(
-                "Runtime.callFunctionOn",
-                {
-                  objectId,
-                  functionDeclaration:
-                    'function(){const visible=el=>!!el&&!!el.getClientRects&&el.getClientRects().length>0;if(!visible(this))return null;const findInput=start=>{let scope=start;for(let i=0;i<4&&scope;i++){const input=scope.querySelector&&scope.querySelector(\'input[type=checkbox]\');if(input)return input;scope=scope.parentElement}return null};const input=findInput(this);if(input){if(!visible(input))return null;const before=!!input.checked;if(!before)(input.closest(\'label\')||input).click();return{kind:"input",before,after:!!input.checked,label:(this.innerText||this.textContent||\'\').trim().slice(0,120),inputHtml:(input.outerHTML||\'\').slice(0,300)}}const cls=String(this.className||\'\');const aria=this.getAttribute&&this.getAttribute("aria-checked");const looksSwitch=/switch|checkbox|toggle|check/i.test(cls)||aria!==null;const rect=this.getBoundingClientRect?this.getBoundingClientRect():{width:0,height:0};const small=rect.width>0&&rect.width<420&&rect.height<90;if(!looksSwitch||!small)return null;const checkedLike=cls.includes("checked")||aria==="true";if(!checkedLike)this.click();return{kind:"custom",before:checkedLike,after:!checkedLike,label:(this.innerText||this.textContent||\'\').trim().slice(0,120),cls:cls.slice(0,160),aria}}',
-                  returnByValue: true,
-                },
-              )) as { result?: { value?: Record<string, unknown> } };
-              const value = invocation.result?.value;
-              if (!value) continue;
-              const record = {
-                pattern: pattern.source,
-                matchedText: textNode.nodeValue?.trim(),
-                ...value,
-              };
-              attempts.push(record);
-              await writeBrowserLog(logTag + " " + JSON.stringify(record));
-              return;
-            }
-          }
-        }
-        if (pass === 0) {
-          const expanded = await this.clickSmallestByText(
-            wc,
-            "更多设置",
-          ).catch(() => false);
-          if (!expanded)
-            await this.clickSmallestByText(wc, "更多选项").catch(() => false);
-          if (expanded) await sleep(1500);
-        }
-      }
-      await writeBrowserLog(
-        logTag + " no-visible-control " + JSON.stringify(attempts),
-      );
-    } catch (error) {
-      await writeBrowserLog(logTag + " error " + String(error));
+      if (!result) continue;
+      const record = {
+        frame: frame.url ? frame.url.slice(0, 160) : "",
+        ...result,
+      };
+      attempts.push(record);
+      await writeBrowserLog(logTag + " " + JSON.stringify(record));
+      if (result.ok) return;
     }
+    await writeBrowserLog(
+      logTag + " no-visible-control " + JSON.stringify(attempts),
+    );
   }
+
   private async waitAndClickButton(
     wc: Electron.WebContents,
     texts: string[],
@@ -3877,21 +3861,16 @@ export class BrowserManager {
             text: snapshot.text.slice(0, 16000),
           }));
           if (platform === "xiaohongshu") {
-            // 原创声明取证：笔记管理列表里目标笔记附近是否带“原创”标识。
-            // 仅作证据留痕，不作为成功判据（平台可能不在列表页展示该标识）。
-            const hit = snapshot.text.indexOf(
-              matchedRaw ?? platformTitle,
+            // 原创声明取证：笔记管理列表页本身不展示"原创"字样（2026-10-26
+            // 实测：整页 2344 字符 0 次命中），无法据此判断声明是否生效。
+            // 真正的声明状态在笔记编辑页的"声明原创"开关上，因此改为进
+            // 编辑页读取该开关的 checked 状态作为权威证据。
+            const original = await this.readXhsOriginalDeclaration(
+              wc,
+              platformTitle,
             );
-            const near =
-              hit >= 0
-                ? snapshot.text.slice(Math.max(0, hit - 400), hit + 400)
-                : "";
             await writeBrowserLog(
-              "xhs-original-marker " +
-                JSON.stringify({
-                  hasOriginalMarker: /原创/.test(near),
-                  near: near.slice(0, 800),
-                }),
+              "xhs-original-declaration " + JSON.stringify(original),
             );
           }
           return { ok: true, url: snapshot.url };
@@ -3913,6 +3892,66 @@ export class BrowserManager {
       url: lastUrl || wc.getURL(),
       reason: platformMap[platform].name + "作品管理未找到目标标题",
     };
+  }
+  /**
+   * 读取小红书笔记编辑页里"声明原创"开关的真实状态。
+   * 后台笔记管理列表页不展示"原创"字样（2026-10-26 实测整页 0 次命中），
+   * 因此判断声明是否生效只能进编辑页读开关。本方法只读不写：不点击保存、
+   * 不修改笔记，读完立即返回原页面。
+   */
+  private async readXhsOriginalDeclaration(
+    wc: Electron.WebContents,
+    title: string,
+  ): Promise<Record<string, unknown>> {
+    const result: Record<string, unknown> = { title };
+    const backUrl = wc.getURL();
+    try {
+      // 在笔记管理页找到目标笔记的"编辑"入口并进入编辑页
+      const opened = await wc
+        .executeJavaScript(
+          `(()=>{const visible=e=>!!e&&e.getClientRects&&e.getClientRects().length>0;
+            const rows=[...document.querySelectorAll('*')].filter(e=>visible(e)&&(e.textContent||'').trim()===${JSON.stringify(title)});
+            for(const row of rows){
+              let scope=row;
+              for(let i=0;i<6&&scope;i++){
+                const edit=[...scope.querySelectorAll('a,span,div,button')].find(e=>visible(e)&&/^(编辑|编辑笔记)$/.test((e.textContent||'').trim()));
+                if(edit){const href=edit.closest('a')?.href||'';if(href)return href;(edit.closest('button')||edit).click();return 'clicked';}
+                scope=scope.parentElement;
+              }
+            }
+            return '';})()`,
+        )
+        .catch(() => "");
+      result.entry = opened;
+      if (opened === "clicked") await sleep(6000);
+      else if (opened) {
+        await wc.loadURL(opened).catch(() => undefined);
+        await sleep(7000);
+      }
+      result.url = wc.getURL();
+      const state = await wc
+        .executeJavaScript(
+          `(()=>{const visible=e=>!!e&&e.getClientRects&&e.getClientRects().length>0;
+            const labels=[...document.querySelectorAll('*')].filter(e=>visible(e)&&!/ /.test((e.textContent||'').trim())&&/原创/.test((e.textContent||'').trim())&&(e.textContent||'').trim().length<=12);
+            const out=labels.slice(0,6).map(l=>{
+              let scope=l;
+              for(let i=0;i<5&&scope;i++){
+                const c=scope.querySelector&&scope.querySelector('input[type=checkbox],[role=switch],[class*=switch],[class*=checkbox]');
+                if(c)return{label:(l.textContent||'').trim(),checked:c.checked!==undefined?!!c.checked:(c.getAttribute('aria-checked')==='true'),tag:c.tagName,cls:String(c.className||'').slice(0,100),html:(c.outerHTML||'').slice(0,220)};
+                scope=scope.parentElement;
+              }
+              return{label:(l.textContent||'').trim(),checked:null,html:(l.outerHTML||'').slice(0,220)};
+            });
+            return{labels:out,bodyHasOriginal:/声明原创|原创声明|标记为原创/.test(document.body?.innerText||'')};})()`,
+        )
+        .catch((error) => ({ error: String(error) }));
+      result.state = state;
+    } catch (error) {
+      result.error = String(error);
+    } finally {
+      await wc.loadURL(backUrl).catch(() => undefined);
+    }
+    return result;
   }
   private async waitForResult(
     wc: Electron.WebContents,

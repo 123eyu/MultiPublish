@@ -8,6 +8,7 @@ import type {
 } from "../shared/types";
 contextBridge.exposeInMainWorld("multiPublish", {
   getData: () => ipcRenderer.invoke("data:get"),
+  getVersion: () => ipcRenderer.invoke("app:version"),
   getRecovery: () => ipcRenderer.invoke("data:recovery"),
   addAccount: (x: AccountInput) => ipcRenderer.invoke("account:add", x),
   removeAccount: (id: string) => ipcRenderer.invoke("account:remove", id),

@@ -473,6 +473,7 @@ function ipc() {
     }
   };
   ipcMain.handle("data:get", () => store.get());
+  ipcMain.handle("app:version", () => app.getVersion());
   ipcMain.handle("data:recovery", () => store.getRecovery());
   ipcMain.handle("browser:close", (_e, id: string) => browsers?.close(id));
   ipcMain.handle("account:add", (_e, input: AccountInput) =>

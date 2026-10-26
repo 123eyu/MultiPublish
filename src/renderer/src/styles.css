@@ -9,3 +9,5 @@
 .cover-preview{display:block;width:220px;max-height:130px;object-fit:cover;margin-top:12px;border-radius:8px;border:1px solid #d9e0ea}
 
 .failure-message{display:block;white-space:normal;word-break:break-word;line-height:1.6}.ant-modal .ant-table-cell{vertical-align:top}
+
+.app-version{margin-left:8px;padding:1px 7px;border-radius:10px;background:rgba(255,255,255,.16);color:#e6ecf7;font-size:12px;font-style:normal;font-weight:500;letter-spacing:.3px}

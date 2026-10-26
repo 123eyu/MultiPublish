@@ -9,6 +9,7 @@ declare global {
   interface Window {
     multiPublish: {
       getData(): Promise<AppData>;
+      getVersion(): Promise<string>;
       getRecovery(): Promise<{
         recovered: boolean;
         source: "primary" | "backup" | "temporary" | "empty";

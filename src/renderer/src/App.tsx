@@ -76,10 +76,15 @@ function Main() {
     [active, setActive] = useState<string>(),
     [tabs, setTabs] = useState<string[]>([]),
     [addOpen, setAddOpen] = useState(false),
+    [version, setVersion] = useState(""),
     host = useRef<HTMLDivElement>(null);
   const refresh = () => window.multiPublish.getData().then(setData);
   useEffect(() => {
     refresh();
+    window.multiPublish
+      .getVersion()
+      .then(setVersion)
+      .catch(() => undefined);
     return window.multiPublish.onDataChanged(refresh);
   }, []);
   useEffect(() => {
@@ -150,6 +155,7 @@ function Main() {
             <em></em>
           </b>
           <span>多平台发布助手</span>
+          {version && <em className="app-version">v{version}</em>}
         </div>
         <Menu
           mode="horizontal"

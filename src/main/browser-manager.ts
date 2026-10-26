@@ -4,6 +4,7 @@ import path from "node:path";
 import type {
   Account,
   BrowserBounds,
+  DouyinSyncTarget,
   LoginStatus,
   PublishDraft,
   TaskStatus,
@@ -1450,6 +1451,33 @@ export class BrowserManager {
         );
         await sleep(1200);
       }
+      if (
+        draft.declareOriginal &&
+        ["douyin", "xiaohongshu", "weixin"].includes(account.platform)
+      ) {
+        await this.ensureCheckboxByText(
+          wc,
+          /原创/,
+          "declare-original " + account.platform,
+        );
+      }
+      if (
+        account.platform === "douyin" &&
+        draft.douyinSyncTargets &&
+        draft.douyinSyncTargets.length
+      ) {
+        const syncPatterns: Record<DouyinSyncTarget, RegExp> = {
+          toutiao: /头条/,
+          fanqie: /番茄/,
+          dongchedi: /懂车帝/,
+        };
+        for (const target of draft.douyinSyncTargets)
+          await this.ensureCheckboxByText(
+            wc,
+            syncPatterns[target],
+            "douyin-sync " + target,
+          );
+      }
       if (account.platform === "weixin") {
         // Install the request patch before the trusted mouse event. The page
         // builds post_create asynchronously after the click, so installing it
@@ -2739,6 +2767,82 @@ export class BrowserManager {
       await sleep(500);
     }
     return undefined;
+  }
+  /**
+   * 在页面上按文本定位一个复选/开关控件并确保其被勾选。
+   * 流程：CDP 展平文档（穿透 Shadow DOM）→ 匹配短文本节点 → 沿祖先链向上
+   * 查找包含 input[type=checkbox] 的容器 → 未勾选则点击；找不到原生 input
+   * 时回退点击文本节点的小尺寸祖先容器（自定义开关控件）。
+   * 全程容错：找不到目标只写日志不抛错，避免中断发布主链路。
+   */
+  private async ensureCheckboxByText(
+    wc: Electron.WebContents,
+    pattern: RegExp,
+    logTag: string,
+  ): Promise<void> {
+    try {
+      if (!wc.debugger.isAttached()) await wc.debugger.attach("1.3");
+      await wc.debugger.sendCommand("DOM.enable");
+      const flat = (await wc.debugger.sendCommand("DOM.getFlattenedDocument", {
+        depth: -1,
+        pierce: true,
+      })) as {
+        nodes: Array<{
+          nodeId: number;
+          parentId?: number;
+          nodeName: string;
+          nodeValue?: string;
+          backendNodeId?: number;
+        }>;
+      };
+      const byId = new Map(flat.nodes.map((node) => [node.nodeId, node]));
+      const textNode = flat.nodes.find(
+        (node) =>
+          node.nodeName === "#text" &&
+          node.nodeValue &&
+          node.nodeValue.trim().length <= 24 &&
+          pattern.test(node.nodeValue),
+      );
+      if (!textNode) {
+        await writeBrowserLog(logTag + " text-not-found");
+        return;
+      }
+      const ancestors: number[] = [];
+      let current: typeof textNode | undefined = textNode;
+      for (let level = 0; level < 6 && current?.parentId; level++) {
+        current = byId.get(current.parentId);
+        if (!current || !current.backendNodeId) break;
+        ancestors.push(current.backendNodeId);
+      }
+      let outcome: Record<string, unknown> | undefined;
+      for (const backendNodeId of ancestors) {
+        const resolved = await wc.debugger.sendCommand("DOM.resolveNode", {
+          backendNodeId,
+        });
+        const objectId = resolved.object?.objectId;
+        if (!objectId) continue;
+        const invocation = (await wc.debugger.sendCommand(
+          "Runtime.callFunctionOn",
+          {
+            objectId,
+            functionDeclaration:
+              'function(){const findInput=(start)=>{let scope=start;for(let i=0;i<4&&scope;i++){const input=scope.querySelector&&scope.querySelector(\'input[type=checkbox]\');if(input)return input;scope=scope.parentElement}return null};const input=findInput(this);if(input){const before=!!input.checked;if(!before)(input.closest(\'label\')||input).click();return{kind:"input",before,after:!!input.checked}}const cls=String(this.className||"");const aria=this.getAttribute&&this.getAttribute("aria-checked");const checkedLike=cls.includes("checked")||aria==="true";const rect=this.getBoundingClientRect?this.getBoundingClientRect():{width:0,height:0};if(!checkedLike&&rect.width>0&&rect.width<420&&rect.height<90&&typeof this.click==="function")this.click();return{kind:"custom",before:checkedLike,clicked:!checkedLike&&rect.width>0&&rect.width<420&&rect.height<90,cls:cls.slice(0,120),aria}}',
+            returnByValue: true,
+          },
+        )) as { result?: { value?: Record<string, unknown> } };
+        const value = invocation.result?.value;
+        if (!value) continue;
+        outcome = value;
+        break;
+      }
+      await writeBrowserLog(
+        logTag +
+          " " +
+          JSON.stringify({ pattern: pattern.source, outcome }),
+      );
+    } catch (error) {
+      await writeBrowserLog(logTag + " error " + String(error));
+    }
   }
   private async waitAndClickButton(
     wc: Electron.WebContents,

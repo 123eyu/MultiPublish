@@ -1525,17 +1525,28 @@ export class BrowserManager {
         draft.declareOriginal &&
         ["douyin", "xiaohongshu", "weixin"].includes(account.platform)
       ) {
-        const result = await this.ensureCheckboxByText(
-          wc,
-          [/声明原创/, /原创声明/, /原创/],
-          "declare-original " + account.platform,
-        );
-        if (result.ok && result.checked)
-          declarationNotes.push("已勾选声明原创");
-        else if (result.ok)
-          declarationNotes.push("声明原创开关已处于勾选状态");
-        else
-          declarationNotes.push("未找到声明原创控件（发布页可能需手动勾选）");
+        if (account.platform === "douyin") {
+          // 实测（2026-10-26 多轮多 frame 扫描）：抖音网页版创作者中心
+          // 发布页没有任何"声明原创"开关——抖音的原创标识由平台根据内容
+          // 自动判定打标，不提供网页端手动声明入口
+          declarationNotes.push(
+            "抖音网页版发布页无声明原创开关（原创标识由平台自动判定，可在抖音App作品页查看）",
+          );
+        } else {
+          const result = await this.ensureCheckboxByText(
+            wc,
+            [/声明原创/, /原创声明/, /原创/],
+            "declare-original " + account.platform,
+          );
+          if (result.ok && result.checked)
+            declarationNotes.push("已勾选声明原创");
+          else if (result.ok)
+            declarationNotes.push("声明原创开关已处于勾选状态");
+          else
+            declarationNotes.push(
+              "未找到声明原创控件（账号可能无原创声明权益）",
+            );
+        }
       }
       if (
         account.platform === "douyin" &&
@@ -2943,17 +2954,21 @@ export class BrowserManager {
           if (!request?.url || request.method !== "POST") return;
           if (!publishUrl.test(request.url)) return;
           const body = request.postData || "";
+          const urlShort = request.url.slice(0, 200);
           // 从请求体里找原创/声明相关字段（不同平台字段名不同）
           const originalMatch = body.match(
             /"[^"]*(original|declare|declaration|statement|is_original|original_flag)[^"]*"\s*:\s*[^,}&]{1,40}/gi,
           );
-          if (!originalMatch) return;
           void writeBrowserLog(
             platform +
               "-publish-original-field " +
               JSON.stringify({
-                url: request.url.slice(0, 200),
-                fields: originalMatch.slice(0, 8),
+                url: urlShort,
+                bodyLength: body.length,
+                fields: originalMatch ? originalMatch.slice(0, 8) : [],
+                // 完整落盘请求体（截断）：字段名匹配不到时也能人工核验，
+                // 例如小红书 v2/note 里若平台剥离了原创字段，这里一目了然
+                body: body.slice(0, 3500),
               }),
           );
           return;
@@ -3067,7 +3082,7 @@ export class BrowserManager {
             const real=root.querySelector&&root.querySelector('input[type=checkbox],input[type=radio],[role=switch],[role=checkbox]');
             if(real){
               real.setAttribute('${mark}','1');
-              return{ok:true,kind:'control',label,tag:real.tagName,cls:String(real.className||'').slice(0,140),html:(real.outerHTML||'').slice(0,320),state:stateOf(real),scopeText:((root.innerText||root.textContent)||'').trim().slice(0,120),rootHtml:(root.outerHTML||'').slice(0,600)};
+              return{ok:true,kind:'control',label,tag:real.tagName,cls:String(real.className||'').slice(0,140),html:(real.outerHTML||'').slice(0,320),state:stateOf(real),disabled:!!real.disabled,scopeText:((root.innerText||root.textContent)||'').trim().slice(0,120),rootHtml:(root.outerHTML||'').slice(0,600)};
             }
             const cands=[...(root.querySelectorAll?root.querySelectorAll('[class*=switch],[class*=checkbox],[class*=toggle],[role=switch]'):[])].filter(isControl);
             for(const c of cands){

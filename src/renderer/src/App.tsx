@@ -865,9 +865,29 @@ function PublishRecords({
     },
     {
       title: "操作",
-      width: 310,
+      width: 380,
       render: (_: unknown, t: PublishTask) => (
         <Space>
+          {["success", "failed"].includes(t.status) && (
+            <Button
+              type="primary"
+              onClick={async () =>
+                setData(await window.multiPublish.retryTask(t.id))
+              }
+            >
+              重新发布
+            </Button>
+          )}
+          {t.status === "pending" && (
+            <Button
+              type="primary"
+              onClick={async () =>
+                setData(await window.multiPublish.retryTask(t.id))
+              }
+            >
+              重新发布
+            </Button>
+          )}
           {!["success", "failed"].includes(t.status) && (
             <Button type="primary" onClick={() => openTask(t)}>
               打开发布页

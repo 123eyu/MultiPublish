@@ -15,6 +15,7 @@ import type {
   AccountInput,
   BrowserBounds,
   PublishDraft,
+  PublishTask,
 } from "../shared/types";
 const dir = path.dirname(fileURLToPath(import.meta.url));
 if (process.env.MULTIPUBLISH_USER_DATA_DIR)
@@ -425,6 +426,52 @@ async function createWindow() {
   });
 }
 function ipc() {
+  /**
+   * 执行单个发布任务：带 45 分钟硬超时。超时后强制中止自动化窗口并把
+   * 任务标记为失败（可重试），避免任务永远停在"等待自动发布"
+   * （2026-10-26 抖音任务卡死实证：CDP 调用在页面未就绪时永不返回）。
+   */
+  const runTask = async (task: PublishTask, draft: PublishDraft) => {
+    const account = store
+      .get()
+      .accounts.find((x) => x.id === task.accountId);
+    if (!account) return;
+    const progress = async (status: any, message: string) => {
+      await store.update((d) => {
+        const current = d.tasks.find((x) => x.id === task.id);
+        if (current)
+          Object.assign(current, {
+            status,
+            message,
+            updatedAt: new Date().toISOString(),
+          });
+      });
+      win?.webContents.send("data:changed");
+    };
+    try {
+      const result = await Promise.race([
+        browsers!.autoPublish(account, draft, progress),
+        new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), 45 * 60 * 1000),
+        ),
+      ]);
+      if (!result) {
+        await browsers!.abortPublish(account.id);
+        await progress(
+          "failed",
+          "发布超时（45 分钟未返回结果），已终止自动化窗口，可点“重新发布”重试",
+        );
+        return;
+      }
+      await progress(result.status, result.message);
+    } catch (error) {
+      await progress(
+        "failed",
+        "自动发布任务异常：" +
+          (error instanceof Error ? error.message : String(error)),
+      );
+    }
+  };
   ipcMain.handle("data:get", () => store.get());
   ipcMain.handle("data:recovery", () => store.getRecovery());
   ipcMain.handle("browser:close", (_e, id: string) => browsers?.close(id));
@@ -551,35 +598,18 @@ function ipc() {
       while (true) {
         const task = tasks[cursor++];
         if (!task) return;
-        const account = store
-          .get()
-          .accounts.find((x) => x.id === task.accountId);
-        if (!account) continue;
-        const progress = async (status: any, message: string) => {
-          await store.update((d) => {
-            const current = d.tasks.find((x) => x.id === task.id);
-            if (current)
-              Object.assign(current, {
-                status,
-                message,
-                updatedAt: new Date().toISOString(),
-              });
-          });
-          win?.webContents.send("data:changed");
-        };
-        try {
-          const result = await browsers!.autoPublish(account, draft, progress);
-          await progress(result.status, result.message);
-        } catch (error) {
-          await progress(
-            "failed",
-            "自动发布任务异常：" +
-              (error instanceof Error ? error.message : String(error)),
-          );
-        }
+        await runTask(task, draft);
       }
     };
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    return store.get();
+  });
+  ipcMain.handle("task:retry", async (_e, id: string) => {
+    const data = store.get(),
+      task = data.tasks.find((x) => x.id === id),
+      draft = data.drafts.find((x) => x.id === task?.draftId);
+    if (!task || !draft) throw new Error("任务或发布内容不存在");
+    await runTask(task, draft);
     return store.get();
   });
   ipcMain.handle("task:open", async (_e, id: string) => {

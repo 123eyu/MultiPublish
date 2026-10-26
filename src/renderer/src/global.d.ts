@@ -37,6 +37,7 @@ declare global {
       ): Promise<AppData>;
       autoPublish(draftId: string): Promise<AppData>;
       openTask(id: string): Promise<AppData>;
+      retryTask(id: string): Promise<AppData>;
       completeTask(id: string): Promise<AppData>;
       failTask(id: string, reason: string): Promise<AppData>;
       onDataChanged(callback: () => void): () => void;

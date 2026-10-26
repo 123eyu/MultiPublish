@@ -14,6 +14,31 @@ import { backendTitleCandidates, publishUploadTimeout } from "./publish-verifica
 type AccountUpdate = { name?: string; loginStatus?: LoginStatus };
 type PublishProgress = (status: TaskStatus, message: string) => Promise<void>;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * CDP 调用超时护栏：Electron 的 debugger 命令在页面未就绪时可能永不返回，
+ * 挂起会让整个发布任务卡死（2026-10-26 抖音任务卡在"等待自动发布"实证）。
+ * 超时后放弃该调用并落盘日志，发布主链路继续。
+ */
+const cdpWithTimeout = async <T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T | undefined> => {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T | undefined>((resolve) => {
+        timer = setTimeout(() => {
+          void writeBrowserLog("publish-cdp-timeout " + label);
+          resolve(undefined);
+        }, ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
 const writeBrowserLog = async (message: string) => {
   const line = `[${new Date().toISOString()}] ${message}\n`;
   await fs
@@ -89,6 +114,8 @@ export class BrowserManager {
   private weixinPostCreateRequested = new Set<number>();
   private weixinPostListTitles = new Map<number, string[]>();
   private xhsOrigins = new Map<string, string>();
+  // 自动化发布窗口按账号登记：任务超时/卡死时可以被强制中止并释放。
+  private automationWindows = new Map<string, BrowserWindow>();
   private active?: string;
   private bounds: BrowserBounds = { x: 280, y: 160, width: 900, height: 650 };
   constructor(
@@ -237,11 +264,29 @@ export class BrowserManager {
     }, 1400);
     this.inspectTimers.set(account.id, timer);
   }
+  /**
+   * 强制中止某个账号正在进行的自动化发布窗口：任务卡死（如 CDP 挂起）时
+   * 由主进程调度器调用，避免任务永远停在"等待发布"。
+   */
+  async abortPublish(accountId: string): Promise<boolean> {
+    const win = this.automationWindows.get(accountId);
+    if (!win || win.isDestroyed()) return false;
+    win.destroy();
+    this.automationWindows.delete(accountId);
+    await writeBrowserLog("publish-aborted account=" + accountId);
+    return true;
+  }
   async autoPublish(
     account: Account,
     draft: PublishDraft,
     progress: PublishProgress,
   ) {
+    // 先把任务从"等待自动发布"推进到可见状态：后续任何卡点都会在界面上
+    // 反映出停在哪一步，而不是永远停在 pending。
+    await progress(
+      "opening",
+      "正在准备" + platformMap[account.platform].name + "发布任务…",
+    );
     const videoPath = draft.mediaPaths[0];
     if (!videoPath)
       return { status: "failed" as const, message: "草稿没有选择视频文件" };
@@ -272,6 +317,7 @@ export class BrowserManager {
     // Keep Chromium rendering without bringing an off-screen publisher to the
     // foreground. Fully hidden windows can stall platform upload processing.
     automationWindow.showInactive();
+    this.automationWindows.set(account.id, automationWindow);
     const wc = automationWindow.webContents;
     wc.setUserAgent(chromeUserAgent);
     wc.setAudioMuted(true);
@@ -284,40 +330,12 @@ export class BrowserManager {
     >();
     // 抖音发布链路曾有"点击后跳转管理页但作品从未落库"的哑弹（URL 跳转
     // 不代表提交成功），挂 Network 监听把发布相关 API 的真实响应状态留痕。
+    // 注意：监听必须在页面加载完成后再挂载——在 about:blank 上提前
+    // attach/Network.enable 会永久挂起（2026-10-26 抖音任务卡在"等待自动
+    // 发布"实证），因此这里只声明句柄，实际挂载见抖音分支。
     let douyinNetworkListener:
       | ((_event: Electron.Event, method: string, params: any) => void)
       | undefined;
-    if (account.platform === "douyin") {
-      try {
-        if (!wc.debugger.isAttached()) await wc.debugger.attach("1.3");
-        await wc.debugger.sendCommand("Network.enable");
-        douyinNetworkListener = (_event, method, params) => {
-          if (method !== "Network.responseReceived") return;
-          const response = (
-            params as { response?: { url?: string; status?: number } }
-          ).response;
-          if (!response?.url) return;
-          if (
-            !/(publish|aweme\/v1\/(video|post)|creator\/content)/i.test(
-              response.url,
-            )
-          )
-            return;
-          void writeBrowserLog(
-            "douyin-network " +
-              JSON.stringify({
-                status: response.status,
-                url: response.url.slice(0, 300),
-              }),
-          );
-        };
-        wc.debugger.on("message", douyinNetworkListener);
-      } catch (error) {
-        await writeBrowserLog(
-          "douyin-network-listener-failed " + String(error),
-        );
-      }
-    }
     try {
       await progress(
         "opening",
@@ -1017,6 +1035,9 @@ export class BrowserManager {
         await sleep(1200);
         if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
         await wc.debugger.sendCommand("DOM.enable");
+        // 发布 API 取证监听：必须在页面加载完成后挂载，且每次 CDP 调用都要
+        // 有超时护栏，任何一步挂起都不能让整个发布任务永远卡住。
+        douyinNetworkListener = await this.installDouyinNetworkProbe(wc);
         const douyinFlat = await wc.debugger.sendCommand(
           "DOM.getFlattenedDocument",
           { depth: -1, pierce: true },
@@ -1493,7 +1514,7 @@ export class BrowserManager {
       ) {
         await this.ensureCheckboxByText(
           wc,
-          /原创/,
+          [/声明原创/, /原创声明/, /原创/],
           "declare-original " + account.platform,
         );
       }
@@ -1510,7 +1531,7 @@ export class BrowserManager {
         for (const target of draft.douyinSyncTargets)
           await this.ensureCheckboxByText(
             wc,
-            syncPatterns[target],
+            [syncPatterns[target]],
             "douyin-sync " + target,
           );
       }
@@ -1882,6 +1903,7 @@ export class BrowserManager {
           .sendCommand("Network.disable")
           .catch(() => undefined);
       }
+      this.automationWindows.delete(account.id);
       await this.flushAccountSession(account.id, "publish-finished");
       if (!automationWindow.isDestroyed()) automationWindow.destroy();
     }
@@ -2826,76 +2848,166 @@ export class BrowserManager {
     return undefined;
   }
   /**
+   * 挂载抖音发布 API 响应监听。必须在页面加载完成后调用：about:blank 上
+   * 的 debugger.attach / Network.enable 会永久挂起（2026-10-26 抖音任务
+   * 卡在"等待自动发布"实证）。所有 CDP 调用都带超时护栏。
+   */
+  private async installDouyinNetworkProbe(
+    wc: Electron.WebContents,
+  ): Promise<
+    ((_event: Electron.Event, method: string, params: any) => void) | undefined
+  > {
+    try {
+      if (!wc.debugger.isAttached()) {
+        // attach 是同步方法，失败会直接抛错，不能当 Promise 用超时护栏包。
+        try {
+          wc.debugger.attach("1.3");
+        } catch (error) {
+          await writeBrowserLog(
+            "douyin-debugger-attach-failed " + String(error),
+          );
+          return undefined;
+        }
+      }
+      await cdpWithTimeout(
+        wc.debugger.sendCommand("Network.enable"),
+        10000,
+        "douyin-network-enable",
+      );
+      const listener = (_event: Electron.Event, method: string, params: any) => {
+        if (method !== "Network.responseReceived") return;
+        const response = (
+          params as { response?: { url?: string; status?: number } }
+        ).response;
+        if (!response?.url) return;
+        if (
+          !/(publish|aweme\/v1\/(video|post)|creator\/content)/i.test(
+            response.url,
+          )
+        )
+          return;
+        void writeBrowserLog(
+          "douyin-network " +
+            JSON.stringify({
+              status: response.status,
+              url: response.url.slice(0, 300),
+            }),
+        );
+      };
+      wc.debugger.on("message", listener);
+      return listener;
+    } catch (error) {
+      await writeBrowserLog("douyin-network-listener-failed " + String(error));
+      return undefined;
+    }
+  }
+  /**
    * 在页面上按文本定位一个复选/开关控件并确保其被勾选。
-   * 流程：CDP 展平文档（穿透 Shadow DOM）→ 匹配短文本节点 → 沿祖先链向上
-   * 查找包含 input[type=checkbox] 的容器 → 未勾选则点击；找不到原生 input
-   * 时回退点击文本节点的小尺寸祖先容器（自定义开关控件）。
-   * 全程容错：找不到目标只写日志不抛错，避免中断发布主链路。
+   * patterns 按优先级排列（如 声明原创 → 原创声明 → 原创），逐个尝试：
+   * CDP 展平文档（穿透 Shadow DOM）→ 匹配短文本节点 → 沿祖先链向上找
+   * 可见且含 input[type=checkbox] 的容器 → 未勾选则点击；无原生 input 时
+   * 回退点击可见且形似开关的小尺寸容器。
+   * 全程容错：找不到目标只写日志不抛错；每次尝试都记录控件身份
+   * （命中文本、label 文本、input HTML、可见性），便于事后判定勾对与否。
    */
   private async ensureCheckboxByText(
     wc: Electron.WebContents,
-    pattern: RegExp,
+    patterns: RegExp[],
     logTag: string,
   ): Promise<void> {
     try {
-      if (!wc.debugger.isAttached()) await wc.debugger.attach("1.3");
-      await wc.debugger.sendCommand("DOM.enable");
-      const flat = (await wc.debugger.sendCommand("DOM.getFlattenedDocument", {
-        depth: -1,
-        pierce: true,
-      })) as {
-        nodes: Array<{
-          nodeId: number;
-          parentId?: number;
-          nodeName: string;
-          nodeValue?: string;
-          backendNodeId?: number;
-        }>;
-      };
+      if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+      await cdpWithTimeout(
+        wc.debugger.sendCommand("DOM.enable"),
+        10000,
+        "declare-original-dom-enable",
+      );
+      const flat = (await cdpWithTimeout(
+        wc.debugger.sendCommand("DOM.getFlattenedDocument", {
+          depth: -1,
+          pierce: true,
+        }),
+        15000,
+        "declare-original-flattened-document",
+      )) as
+        | {
+            nodes: Array<{
+              nodeId: number;
+              parentId?: number;
+              nodeName: string;
+              nodeValue?: string;
+              backendNodeId?: number;
+            }>;
+          }
+        | undefined;
+      if (!flat) {
+        await writeBrowserLog(logTag + " flattened-document-timeout");
+        return;
+      }
       const byId = new Map(flat.nodes.map((node) => [node.nodeId, node]));
-      const textNode = flat.nodes.find(
+      const shortTexts = flat.nodes.filter(
         (node) =>
           node.nodeName === "#text" &&
           node.nodeValue &&
-          node.nodeValue.trim().length <= 24 &&
-          pattern.test(node.nodeValue),
+          node.nodeValue.trim().length <= 24,
       );
-      if (!textNode) {
-        await writeBrowserLog(logTag + " text-not-found");
-        return;
-      }
-      const ancestors: number[] = [];
-      let current: typeof textNode | undefined = textNode;
-      for (let level = 0; level < 6 && current?.parentId; level++) {
-        current = byId.get(current.parentId);
-        if (!current || !current.backendNodeId) break;
-        ancestors.push(current.backendNodeId);
-      }
-      let outcome: Record<string, unknown> | undefined;
-      for (const backendNodeId of ancestors) {
-        const resolved = await wc.debugger.sendCommand("DOM.resolveNode", {
-          backendNodeId,
-        });
-        const objectId = resolved.object?.objectId;
-        if (!objectId) continue;
-        const invocation = (await wc.debugger.sendCommand(
-          "Runtime.callFunctionOn",
-          {
-            objectId,
-            functionDeclaration:
-              'function(){const findInput=(start)=>{let scope=start;for(let i=0;i<4&&scope;i++){const input=scope.querySelector&&scope.querySelector(\'input[type=checkbox]\');if(input)return input;scope=scope.parentElement}return null};const input=findInput(this);if(input){const before=!!input.checked;if(!before)(input.closest(\'label\')||input).click();return{kind:"input",before,after:!!input.checked}}const cls=String(this.className||"");const aria=this.getAttribute&&this.getAttribute("aria-checked");const checkedLike=cls.includes("checked")||aria==="true";const rect=this.getBoundingClientRect?this.getBoundingClientRect():{width:0,height:0};if(!checkedLike&&rect.width>0&&rect.width<420&&rect.height<90&&typeof this.click==="function")this.click();return{kind:"custom",before:checkedLike,clicked:!checkedLike&&rect.width>0&&rect.width<420&&rect.height<90,cls:cls.slice(0,120),aria}}',
-            returnByValue: true,
-          },
-        )) as { result?: { value?: Record<string, unknown> } };
-        const value = invocation.result?.value;
-        if (!value) continue;
-        outcome = value;
-        break;
+      const attempts: Array<Record<string, unknown>> = [];
+      const visited = new Set<number>();
+      // 第一轮找不到可见控件时，尝试展开"更多设置/更多选项"后再扫一次：
+      // 平台的原创声明常折叠在高级选项里。
+      for (let pass = 0; pass < 2; pass++) {
+        for (const pattern of patterns) {
+          for (const textNode of shortTexts) {
+            if (visited.has(textNode.nodeId)) continue;
+            if (!pattern.test(textNode.nodeValue!)) continue;
+            visited.add(textNode.nodeId);
+            const ancestors: number[] = [];
+            let current: typeof textNode | undefined = textNode;
+            for (let level = 0; level < 6 && current?.parentId; level++) {
+              current = byId.get(current.parentId);
+              if (!current || !current.backendNodeId) break;
+              ancestors.push(current.backendNodeId);
+            }
+            for (const backendNodeId of ancestors) {
+              const resolved = await wc.debugger.sendCommand("DOM.resolveNode", {
+                backendNodeId,
+              });
+              const objectId = resolved.object?.objectId;
+              if (!objectId) continue;
+              const invocation = (await wc.debugger.sendCommand(
+                "Runtime.callFunctionOn",
+                {
+                  objectId,
+                  functionDeclaration:
+                    'function(){const visible=el=>!!el&&!!el.getClientRects&&el.getClientRects().length>0;if(!visible(this))return null;const findInput=start=>{let scope=start;for(let i=0;i<4&&scope;i++){const input=scope.querySelector&&scope.querySelector(\'input[type=checkbox]\');if(input)return input;scope=scope.parentElement}return null};const input=findInput(this);if(input){if(!visible(input))return null;const before=!!input.checked;if(!before)(input.closest(\'label\')||input).click();return{kind:"input",before,after:!!input.checked,label:(this.innerText||this.textContent||\'\').trim().slice(0,120),inputHtml:(input.outerHTML||\'\').slice(0,300)}}const cls=String(this.className||\'\');const aria=this.getAttribute&&this.getAttribute("aria-checked");const looksSwitch=/switch|checkbox|toggle|check/i.test(cls)||aria!==null;const rect=this.getBoundingClientRect?this.getBoundingClientRect():{width:0,height:0};const small=rect.width>0&&rect.width<420&&rect.height<90;if(!looksSwitch||!small)return null;const checkedLike=cls.includes("checked")||aria==="true";if(!checkedLike)this.click();return{kind:"custom",before:checkedLike,after:!checkedLike,label:(this.innerText||this.textContent||\'\').trim().slice(0,120),cls:cls.slice(0,160),aria}}',
+                  returnByValue: true,
+                },
+              )) as { result?: { value?: Record<string, unknown> } };
+              const value = invocation.result?.value;
+              if (!value) continue;
+              const record = {
+                pattern: pattern.source,
+                matchedText: textNode.nodeValue?.trim(),
+                ...value,
+              };
+              attempts.push(record);
+              await writeBrowserLog(logTag + " " + JSON.stringify(record));
+              return;
+            }
+          }
+        }
+        if (pass === 0) {
+          const expanded = await this.clickSmallestByText(
+            wc,
+            "更多设置",
+          ).catch(() => false);
+          if (!expanded)
+            await this.clickSmallestByText(wc, "更多选项").catch(() => false);
+          if (expanded) await sleep(1500);
+        }
       }
       await writeBrowserLog(
-        logTag +
-          " " +
-          JSON.stringify({ pattern: pattern.source, outcome }),
+        logTag + " no-visible-control " + JSON.stringify(attempts),
       );
     } catch (error) {
       await writeBrowserLog(logTag + " error " + String(error));
@@ -3636,10 +3748,18 @@ export class BrowserManager {
     if (platform === "weixin") {
       try {
         if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
-        await wc.debugger.sendCommand("Page.enable");
-        await wc.debugger.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
-          source: weixinPostListRecorder,
-        });
+        await cdpWithTimeout(
+          wc.debugger.sendCommand("Page.enable"),
+          10000,
+          "weixin-page-enable",
+        );
+        await cdpWithTimeout(
+          wc.debugger.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
+            source: weixinPostListRecorder,
+          }),
+          10000,
+          "weixin-post-list-recorder",
+        );
       } catch (error) {
         await writeBrowserLog(
           "weixin-post-list-recorder-install-failed " + String(error),
@@ -3665,12 +3785,21 @@ export class BrowserManager {
     const expected = rawExpected.map(normalize).filter((value) => value.length >= 2);
     const start = Date.now();
     let lastUrl = "";
+    let lastSnapshot = "";
     while (Date.now() - start < timeout) {
-      await wc.loadURL(managerUrl).catch((error) => {
+      // 小红书必须直接进入笔记管理页：停留在创作者首页时，页面上的
+      // “最新笔记”卡片只是历史作品，会把旧作误判成新发布
+      // （2026-10-26 claude-seo 实证：快照 URL 是 /new/home，命中的是
+      // 首页里的 microdu 旧笔记）。
+      const targetUrl =
+        platform === "xiaohongshu"
+          ? xhsOriginFromUrl(wc.getURL()) + "/new/note-manager"
+          : managerUrl;
+      await wc.loadURL(targetUrl).catch((error) => {
         if (!/ERR_ABORTED/.test(String(error))) throw error;
       });
       await sleep(7000);
-      if (platform === "xiaohongshu") {
+      if (platform === "xiaohongshu" && !/note-manager/.test(wc.getURL())) {
         const opened = await this.clickSmallestByText(wc, "笔记管理");
         if (!opened) {
           const href = await wc
@@ -3724,6 +3853,7 @@ export class BrowserManager {
           )
           .catch(() => ({ url: wc.getURL(), text: "", login: false }));
         lastUrl = snapshot.url;
+        lastSnapshot = snapshot.text;
         if (snapshot.login)
           return {
             ok: false,
@@ -3746,11 +3876,38 @@ export class BrowserManager {
               : { kind: "normalized", value: matchedNormalized },
             text: snapshot.text.slice(0, 16000),
           }));
+          if (platform === "xiaohongshu") {
+            // 原创声明取证：笔记管理列表里目标笔记附近是否带“原创”标识。
+            // 仅作证据留痕，不作为成功判据（平台可能不在列表页展示该标识）。
+            const hit = snapshot.text.indexOf(
+              matchedRaw ?? platformTitle,
+            );
+            const near =
+              hit >= 0
+                ? snapshot.text.slice(Math.max(0, hit - 400), hit + 400)
+                : "";
+            await writeBrowserLog(
+              "xhs-original-marker " +
+                JSON.stringify({
+                  hasOriginalMarker: /原创/.test(near),
+                  near: near.slice(0, 800),
+                }),
+            );
+          }
           return { ok: true, url: snapshot.url };
         }
         await sleep(3000);
       }
     }
+    await writeBrowserLog(
+      "backend-title-miss " +
+        JSON.stringify({
+          platform,
+          title: platformTitle,
+          url: lastUrl || wc.getURL(),
+          text: (lastSnapshot || "").slice(0, 16000),
+        }),
+    );
     return {
       ok: false,
       url: lastUrl || wc.getURL(),

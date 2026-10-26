@@ -9,6 +9,10 @@ export function backendTitleCandidates(platform: string, title: string) {
   // 命中旧作造成假“发布成功”（2026-10-25 microduck 实证：页面全文无
   // microduck，但 12 字前缀命中 8 处旧作），因此抖音只允许整题匹配。
   if (platform === "douyin") return [title];
+  // 小红书笔记标题上限 20 字、列表整题渲染，同前缀系列旧作同样会让短前缀
+  // 候选误命中（2026-10-26 claude-seo 实证：整页快照无该标题，却匹配到
+  // 首页“最新笔记”里的 microdu 旧笔记），因此小红书也只允许整题匹配。
+  if (platform === "xiaohongshu") return [title];
   return [title, ...[24, 20, 16, 12].map((limit) => Array.from(title).slice(0, limit).join(""))]
     .filter((value) => value.length >= 2);
 }

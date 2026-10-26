@@ -32,6 +32,7 @@ contextBridge.exposeInMainWorld("multiPublish", {
     ipcRenderer.invoke("publish:create", d),
   autoPublish: (draftId: string) => ipcRenderer.invoke("publish:auto", draftId),
   openTask: (id: string) => ipcRenderer.invoke("task:open", id),
+  retryTask: (id: string) => ipcRenderer.invoke("task:retry", id),
   completeTask: (id: string) => ipcRenderer.invoke("task:complete", id),
   failTask: (id: string, reason: string) =>
     ipcRenderer.invoke("task:fail", id, reason),

@@ -336,6 +336,9 @@ export class BrowserManager {
     let douyinNetworkListener:
       | ((_event: Electron.Event, method: string, params: any) => void)
       | undefined;
+    let xhsNetworkListener:
+      | ((_event: Electron.Event, method: string, params: any) => void)
+      | undefined;
     try {
       await progress(
         "opening",
@@ -586,6 +589,13 @@ export class BrowserManager {
         loginStatus: "logged_in",
         ...(initialLogin.name ? { name: initialLogin.name } : {}),
       });
+      if (account.platform === "xiaohongshu") {
+        // 小红书发布接口请求体取证：确认"声明原创"是否随发布请求提交
+        xhsNetworkListener = await this.installPublishRequestProbe(
+          wc,
+          "xiaohongshu",
+        );
+      }
       if (
         (account.platform === "weixin" || account.platform === "bilibili") &&
         process.env.MULTIPUBLISH_PUBLISH_SELF_TEST_DRAFT_ID === draft.id
@@ -1533,6 +1543,8 @@ export class BrowserManager {
         draft.douyinSyncTargets.length
       ) {
         const syncPatterns: Record<DouyinSyncTarget, RegExp> = {
+          // 抖音同步发布的平台名在不同版本有变体："今日头条/头条号"、
+          // "番茄小说/番茄"、"懂车帝"，因此用宽松匹配
           toutiao: /头条/,
           fanqie: /番茄/,
           dongchedi: /懂车帝/,
@@ -1931,6 +1943,8 @@ export class BrowserManager {
           .sendCommand("Network.disable")
           .catch(() => undefined);
       }
+      if (xhsNetworkListener)
+        wc.debugger.removeListener("message", xhsNetworkListener);
       this.automationWindows.delete(account.id);
       await this.flushAccountSession(account.id, "publish-finished");
       if (!automationWindow.isDestroyed()) automationWindow.destroy();
@@ -2885,6 +2899,19 @@ export class BrowserManager {
   ): Promise<
     ((_event: Electron.Event, method: string, params: any) => void) | undefined
   > {
+    return this.installPublishRequestProbe(wc, "douyin");
+  }
+  /**
+   * 挂载发布请求探针：抓取平台**发布接口的请求体**，从中提取原创声明标记。
+   * 这是"原创到底有没有随发布请求提交"的权威证据——比看页面控件状态更可靠，
+   * 因为服务端只认请求体里的字段。
+   */
+  private async installPublishRequestProbe(
+    wc: Electron.WebContents,
+    platform: string,
+  ): Promise<
+    ((_event: Electron.Event, method: string, params: any) => void) | undefined
+  > {
     try {
       if (!wc.debugger.isAttached()) {
         // attach 是同步方法，失败会直接抛错，不能当 Promise 用超时护栏包。
@@ -2892,7 +2919,7 @@ export class BrowserManager {
           wc.debugger.attach("1.3");
         } catch (error) {
           await writeBrowserLog(
-            "douyin-debugger-attach-failed " + String(error),
+            platform + "-debugger-attach-failed " + String(error),
           );
           return undefined;
         }
@@ -2900,9 +2927,37 @@ export class BrowserManager {
       await cdpWithTimeout(
         wc.debugger.sendCommand("Network.enable"),
         10000,
-        "douyin-network-enable",
+        platform + "-network-enable",
       );
+      const publishUrl =
+        platform === "douyin"
+          ? /(aweme\/v1\/(video|post)\/publish|publish\/video|aweme\/v1\/create)/i
+          : /(publish|note|create|upload)/i;
       const listener = (_event: Electron.Event, method: string, params: any) => {
+        if (method === "Network.requestWillBeSent") {
+          const request = (
+            params as {
+              request?: { url?: string; method?: string; postData?: string };
+            }
+          ).request;
+          if (!request?.url || request.method !== "POST") return;
+          if (!publishUrl.test(request.url)) return;
+          const body = request.postData || "";
+          // 从请求体里找原创/声明相关字段（不同平台字段名不同）
+          const originalMatch = body.match(
+            /"[^"]*(original|declare|declaration|statement|is_original|original_flag)[^"]*"\s*:\s*[^,}&]{1,40}/gi,
+          );
+          if (!originalMatch) return;
+          void writeBrowserLog(
+            platform +
+              "-publish-original-field " +
+              JSON.stringify({
+                url: request.url.slice(0, 200),
+                fields: originalMatch.slice(0, 8),
+              }),
+          );
+          return;
+        }
         if (method !== "Network.responseReceived") return;
         const response = (
           params as { response?: { url?: string; status?: number } }
@@ -2915,7 +2970,8 @@ export class BrowserManager {
         )
           return;
         void writeBrowserLog(
-          "douyin-network " +
+          platform +
+            "-network " +
             JSON.stringify({
               status: response.status,
               url: response.url.slice(0, 300),
@@ -2925,25 +2981,30 @@ export class BrowserManager {
       wc.debugger.on("message", listener);
       return listener;
     } catch (error) {
-      await writeBrowserLog("douyin-network-listener-failed " + String(error));
+      await writeBrowserLog(
+        platform + "-network-listener-failed " + String(error),
+      );
       return undefined;
     }
   }
   /**
    * 在页面上按文本定位一个复选/开关控件并确保其被勾选。
    *
-   * 关键实现要点（2026-10-26 取证驱动）：
-   * 1) 抖音/小红书发布页是微前端，声明控件可能位于 iframe 内，只查主
-   *    frame 会全部落空（v0.1.29 抖音"原创/头条/番茄/懂车帝"四个目标
-   *    全是 no-visible-control），因此逐 frame 扫描。
-   * 2) 点击后必须复验状态（before/after），"点了"不等于"生效"。
-   * 3) 日志记录控件身份（label 文本/HTML 片段/控件类型），才能证明勾中
-   *    的是"声明原创"而不是页面上别的复选框。
+   * 三段式（探测 → 点击 → 复验），2026-10-26 取证驱动：
+   * 1) 逐 frame 扫描（主 frame + 子 frame）：抖音/小红书发布页是微前端，
+   *    声明控件可能在 iframe 内，只查主 frame 会全部落空。
+   * 2) 状态读不到（null）时**照样点击**：小红书的"原创声明"是自定义
+   *    switch（标签 class="custom-switch-text-desc"，无 checked/aria-checked），
+   *    旧逻辑 `before===false 才点` 导致永远不点（19:11 批次实证：
+   *    找到控件 before=null after=null，从未点击）。
+   * 3) 点击后复验并记录控件身份（label/HTML/所在 frame/状态变化），
+   *    才能证明勾中的是"声明原创"而不是页面上别的复选框。
    */
   private async ensureCheckboxByText(
     wc: Electron.WebContents,
     patterns: RegExp[],
     logTag: string,
+    attempts = 3,
   ): Promise<{
     ok: boolean;
     checked?: boolean | null;
@@ -2951,31 +3012,45 @@ export class BrowserManager {
     frame?: string;
   }> {
     const frames = [wc.mainFrame, ...wc.mainFrame.framesInSubtree];
-    const attempts: Array<Record<string, unknown>> = [];
-    for (const frame of frames) {
-      const script = `(()=>{
+    const attemptsLog: Array<Record<string, unknown>> = [];
+    const mark = "data-multipublish-probe";
+    for (let round = 0; round < attempts; round++) {
+      if (round > 0) {
+        // 平台发布表单是异步渲染的：抖音 content/upload 会自动跳到
+        // content/post/video（发布设置页），新页面上的声明/同步控件要过
+        // 几秒才出现（19:11 批次实证：首扫时新页尚未渲染，四个目标全部落空）。
+        await sleep(3000);
+      }
+      // 等待页面出现"发布"按钮，确保表单主体已渲染完毕
+      await wc
+        .executeJavaScript(
+          "(()=>{const b=[...document.querySelectorAll('button')].find(x=>(x.textContent||'').trim()==='发布');if(b){b.scrollIntoView({block:'center'});return true}return false})()",
+        )
+        .catch(() => false);
+      for (const frame of frames) {
+      // 阶段一：探测候选控件（只标记，不点击）
+      const probe = `(()=>{
         const visible=el=>!!el&&!!el.getClientRects&&el.getClientRects().length>0;
         const patterns=${JSON.stringify(patterns.map((p) => p.source))}.map(s=>new RegExp(s));
-        const expanders=[...document.querySelectorAll('button,div,span,label,a')]
-          .filter(e=>visible(e)&&/^(更多设置|更多选项|高级设置|作品声明|同步发布|同步到|全部设置)$/.test((e.textContent||'').trim()))
-          .slice(0,4);
-        for(const ex of expanders){try{(ex.closest('button')||ex).click()}catch{}}
+        // 展开折叠区：抖音"作品声明"、小红书"更多设置"等入口
+        for(const ex of [...document.querySelectorAll('button,div,span,label,a')]
+          .filter(e=>visible(e)&&/^(更多设置|更多选项|高级设置|作品声明|同步发布|同步到|全部设置|声明原创|原创声明)$/.test((e.textContent||'').trim()))
+          .slice(0,5)){try{(ex.closest('button')||ex).click()}catch{}}
+        const isControl=el=>{
+          if(!el||el.tagName==='INPUT')return false;
+          const cls=String(el.className||'');
+          if(/text|desc|label|icon|arrow|tip|title/i.test(cls))return false;
+          return /switch|checkbox|toggle/i.test(cls)||el.getAttribute('role')==='switch';
+        };
         const stateOf=el=>{
           if(!el)return null;
           if(el.checked!==undefined)return !!el.checked;
           const aria=el.getAttribute&&el.getAttribute('aria-checked');
           if(aria==='true'||aria==='false')return aria==='true';
           const cls=String(el.className||'');
-          if(/checked|is-checked|active|selected/.test(cls))return true;
-          return null;
-        };
-        const findControl=root=>{
-          let scope=root;
-          for(let i=0;i<5&&scope;i++){
-            const c=scope.querySelector&&scope.querySelector('input[type=checkbox],input[type=radio],[role=switch],[role=checkbox],[class*=switch],[class*=checkbox],[class*=toggle]');
-            if(c)return c;
-            scope=scope.parentElement;
-          }
+          if(/checked|switched|is-on|is-active|active|selected|opened/i.test(cls))return true;
+          const inner=el.querySelector&&el.querySelector('[class*=checked],[class*=switched],[class*=active],[class*=selected]');
+          if(inner)return true;
           return null;
         };
         const texts=[...document.querySelectorAll('*')].filter(e=>{
@@ -2985,57 +3060,153 @@ export class BrowserManager {
         });
         for(const t of texts){
           const label=(t.textContent||'').trim();
-          let root=t;
-          for(let i=0;i<4&&root;i++){
-            const control=findControl(root);
-            if(control){
-              const before=stateOf(control);
-              if(before===false){
-                try{(control.closest('label')||control).click()}catch{}
-                const after=stateOf(control);
-                return{ok:true,kind:'control',before,after,label,controlTag:control.tagName,controlCls:String(control.className||'').slice(0,120),html:(control.outerHTML||'').slice(0,300),scopeText:(root.innerText||root.textContent||'').trim().slice(0,120),rect:(()=>{const r=root.getBoundingClientRect();return{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}})()};
+          const containers=[];
+          let scope=t;
+          for(let i=0;i<6&&scope;i++){containers.push(scope);scope=scope.parentElement;}
+          for(const root of containers){
+            const real=root.querySelector&&root.querySelector('input[type=checkbox],input[type=radio],[role=switch],[role=checkbox]');
+            if(real){
+              real.setAttribute('${mark}','1');
+              return{ok:true,kind:'control',label,tag:real.tagName,cls:String(real.className||'').slice(0,140),html:(real.outerHTML||'').slice(0,320),state:stateOf(real),scopeText:((root.innerText||root.textContent)||'').trim().slice(0,120),rootHtml:(root.outerHTML||'').slice(0,600)};
+            }
+            const cands=[...(root.querySelectorAll?root.querySelectorAll('[class*=switch],[class*=checkbox],[class*=toggle],[role=switch]'):[])].filter(isControl);
+            for(const c of cands){
+              const rect=c.getBoundingClientRect();
+              if(rect.width<=0||rect.width>420||rect.height<=0||rect.height>90||!visible(c))continue;
+              c.setAttribute('${mark}','1');
+              return{ok:true,kind:'switch',label,tag:c.tagName,cls:String(c.className||'').slice(0,140),html:(c.outerHTML||'').slice(0,320),state:stateOf(c),scopeText:((root.innerText||root.textContent)||'').trim().slice(0,120),rootHtml:(root.outerHTML||'').slice(0,600)};
+            }
+            // 卡片式控件：抖音"同步发布"的平台项是图标卡片，没有
+            // input/switch class，只能按文本命中元素的祖先卡片来点。
+            // 命中文本的最近可点击祖先（带 cursor/role 或本身就是可点 div）
+            if(root!==t&&root.tagName!=='SPAN'&&root.tagName!=='B'&&root.tagName!=='I'){
+              const rect=root.getBoundingClientRect();
+              const txt=((root.innerText||root.textContent)||'').trim();
+              if(rect.width>0&&rect.width<360&&rect.height>0&&rect.height<220&&visible(root)&&txt.length<=24){
+                const clickable=root.getAttribute('role')==='button'||root.tagName==='BUTTON'||root.tagName==='A'||/cursor-pointer|clickable|selectable|platform-item|sync-item|item/i.test(String(root.className||''));
+                if(clickable){
+                  root.setAttribute('${mark}','1');
+                  return{ok:true,kind:'card',label,tag:root.tagName,cls:String(root.className||'').slice(0,140),html:(root.outerHTML||'').slice(0,320),state:stateOf(root),scopeText:txt.slice(0,120),rootHtml:(root.outerHTML||'').slice(0,600)};
+                }
               }
-              return{ok:true,kind:'control',before,after:before,label,controlTag:control.tagName,controlCls:String(control.className||'').slice(0,120),html:(control.outerHTML||'').slice(0,300),scopeText:(root.innerText||root.textContent||'').trim().slice(0,120),rect:(()=>{const r=root.getBoundingClientRect();return{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}})()};
             }
-            const cls=String(root.className||'');
-            const aria=root.getAttribute&&root.getAttribute('aria-checked');
-            const looksSwitch=/switch|checkbox|toggle|check/i.test(cls)||aria!==null;
-            const r=root.getBoundingClientRect();
-            if(looksSwitch&&r.width>0&&r.width<420&&r.height<90&&visible(root)){
-              const before=stateOf(root);
-              if(before===false){try{root.click()}catch{}}
-              return{ok:true,kind:'switch',before,after:stateOf(root),label,controlTag:root.tagName,controlCls:cls.slice(0,120),html:(root.outerHTML||'').slice(0,300),scopeText:(root.innerText||root.textContent||'').trim().slice(0,120),rect:{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}};
-            }
-            root=root.parentElement;
           }
         }
         return{ok:false};
       })()`;
-      const result = (await frame
-        .executeJavaScript(script)
+      const found = (await frame
+        .executeJavaScript(probe)
         .catch(() => undefined)) as
         | ({ ok: boolean } & Record<string, unknown>)
         | undefined;
-      if (!result) continue;
+      if (!found?.ok) {
+        if (found) attemptsLog.push({ round, frame: frame.url, ...found });
+        continue;
+      }
+      // 阶段二：点击。优先用真实鼠标事件（Input.dispatchMouseEvent），
+      // 平台自绘的 switch/卡片只响应 trusted 事件，el.click() 会被忽略。
+      const clickInfo = (await frame
+        .executeJavaScript(
+          `(()=>{const el=document.querySelector('[${mark}="1"]');if(!el)return null;
+            const r=el.getBoundingClientRect();
+            return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),w:Math.round(r.width),h:Math.round(r.height),tag:el.tagName};})()`,
+        )
+        .catch(() => undefined)) as
+        | { x: number; y: number; w: number; h: number; tag: string }
+        | undefined;
+      let clicked = false;
+      if (clickInfo && clickInfo.w > 0 && clickInfo.h > 0) {
+        try {
+          if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+          await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+            type: "mouseMoved",
+            x: clickInfo.x,
+            y: clickInfo.y,
+          });
+          await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+            type: "mousePressed",
+            x: clickInfo.x,
+            y: clickInfo.y,
+            button: "left",
+            buttons: 1,
+            clickCount: 1,
+          });
+          await sleep(120);
+          await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+            type: "mouseReleased",
+            x: clickInfo.x,
+            y: clickInfo.y,
+            button: "left",
+            buttons: 0,
+            clickCount: 1,
+          });
+          clicked = true;
+        } catch {}
+      }
+      if (!clicked)
+        clicked = (
+          await frame
+            .executeJavaScript(
+              `(()=>{const el=document.querySelector('[${mark}="1"]');if(!el)return false;
+              const input=el.matches('input')?el:(el.closest('label')?.querySelector('input[type=checkbox]')||el);
+              try{(input.closest('label')||input).click()}catch{}
+              return true;})()`,
+            )
+            .catch(() => false)
+        ) === true;
+      await sleep(700);
+      // 阶段三：复验状态
+      const verify = (await frame
+        .executeJavaScript(
+          `(()=>{const el=document.querySelector('[${mark}="1"]');if(!el)return null;
+            const stateOf=el=>{
+              if(el.checked!==undefined)return !!el.checked;
+              const aria=el.getAttribute&&el.getAttribute('aria-checked');
+              if(aria==='true'||aria==='false')return aria==='true';
+              const cls=String(el.className||'');
+              if(/checked|switched|is-on|is-active|active|selected|opened/i.test(cls))return true;
+              const inner=el.querySelector&&el.querySelector('[class*=checked],[class*=switched],[class*=active],[class*=selected]');
+              if(inner)return true;
+              return null;
+            };
+            const input=el.matches('input')?el:(el.closest('label')?.querySelector('input[type=checkbox]')||el);
+            return{state:stateOf(el),inputState:stateOf(input),html:(el.outerHTML||'').slice(0,320),cls:String(el.className||'').slice(0,140)};})()`,
+        )
+        .catch(() => undefined)) as Record<string, unknown> | undefined;
+      const state = (verify?.state ?? null) as boolean | null;
+      const inputState = (verify?.inputState ?? null) as boolean | null;
+      const after = state ?? inputState;
       const record = {
         frame: frame.url ? frame.url.slice(0, 160) : "",
-        ...result,
+        kind: found.kind,
+        label: found.label,
+        controlTag: found.tag,
+        controlCls: found.cls,
+        controlHtml: found.html,
+        scopeText: found.scopeText,
+        before: found.state ?? null,
+        after,
+        clicked,
+        stateReadable: state !== null || inputState !== null,
+        verifyHtml: verify?.html,
       };
-      attempts.push(record);
+      attemptsLog.push(record);
       await writeBrowserLog(logTag + " " + JSON.stringify(record));
-      if (result.ok)
-        return {
-          ok: true,
-          checked: result.after === true,
-          label: typeof result.label === "string" ? result.label : undefined,
-          frame: record.frame,
-        };
+      if (!clicked) continue;
+      return {
+        ok: true,
+        checked: after === true,
+        label: typeof found.label === "string" ? found.label : undefined,
+        frame: record.frame,
+      };
+      }
     }
     await writeBrowserLog(
-      logTag + " no-visible-control " + JSON.stringify(attempts),
+      logTag + " no-visible-control " + JSON.stringify(attemptsLog),
     );
     return { ok: false };
   }
+
 
   private async waitAndClickButton(
     wc: Electron.WebContents,

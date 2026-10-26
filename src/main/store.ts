@@ -5,6 +5,7 @@ import type {
   AccountSelections,
   AppData,
   ContentType,
+  DouyinSyncTarget,
   PublishDraft,
   PublishTask,
 } from "../shared/types";
@@ -88,6 +89,13 @@ function parseAppData(value: unknown): AppData {
       throw new Error("草稿记录无效");
     const mediaPaths = stringArray(draft.mediaPaths, "视频路径");
     const accountIds = stringArray(draft.accountIds, "账号引用");
+    const syncTargets: DouyinSyncTarget[] = ["toutiao", "fanqie", "dongchedi"];
+    const douyinSyncTargets = Array.isArray(draft.douyinSyncTargets)
+      ? draft.douyinSyncTargets.filter(
+          (item): item is DouyinSyncTarget =>
+            syncTargets.includes(item as DouyinSyncTarget),
+        )
+      : [];
     return {
       ...draft,
       id: draft.id as string,
@@ -98,6 +106,10 @@ function parseAppData(value: unknown): AppData {
         draft.topics === undefined ? [] : stringArray(draft.topics, "话题标签"),
       mediaPaths,
       accountIds,
+      declareOriginal: draft.declareOriginal === true || undefined,
+      douyinSyncTargets: douyinSyncTargets.length
+        ? douyinSyncTargets
+        : undefined,
       createdAt: isString(draft.createdAt)
         ? draft.createdAt
         : new Date(0).toISOString(),

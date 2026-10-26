@@ -36,6 +36,7 @@ import type {
   Account,
   AppData,
   ContentType,
+  DouyinSyncTarget,
   Platform,
   PublishDraft,
   PublishTask,
@@ -43,6 +44,16 @@ import type {
 import { platformMap, platforms } from "../../shared/platforms";
 const { Header, Sider, Content } = Layout;
 type Page = "accounts" | "image" | "video";
+const douyinSyncOptions: { value: DouyinSyncTarget; label: string }[] = [
+  { value: "toutiao", label: "头条" },
+  { value: "fanqie", label: "番茄" },
+  { value: "dongchedi", label: "懂车帝" },
+];
+const declareOriginalPlatforms: Platform[] = [
+  "douyin",
+  "xiaohongshu",
+  "weixin",
+];
 const empty: AppData = {
   accounts: [],
   drafts: [],
@@ -356,6 +367,10 @@ function Publish({
     [coverPreview, setCoverPreview] = useState(""),
     [tags, setTags] = useState<string[]>([]),
     [tagInput, setTagInput] = useState(""),
+    [declareOriginal, setDeclareOriginal] = useState(false),
+    [douyinSyncTargets, setDouyinSyncTargets] = useState<DouyinSyncTarget[]>(
+      douyinSyncOptions.map((option) => option.value),
+    ),
     [form] = Form.useForm();
   const extractCoverWithTimeout = (videoPath: string) =>
     Promise.race([
@@ -411,6 +426,10 @@ function Publish({
         mediaPaths: media,
         coverPath: cover[0],
         accountIds: value.accountIds,
+        declareOriginal: declareOriginal || undefined,
+        douyinSyncTargets: douyinSyncTargets.length
+          ? douyinSyncTargets
+          : undefined,
       });
       hide();
       setData(created);
@@ -668,6 +687,67 @@ function Publish({
                     ))}
                   </Checkbox.Group>
                 </Form.Item>
+              </Form.Item>
+              <Form.Item
+                noStyle
+                shouldUpdate={(prev, next) => prev.accountIds !== next.accountIds}
+              >
+                {() => {
+                  const selected: string[] =
+                    form.getFieldValue("accountIds") || [];
+                  const selectedPlatforms = new Set(
+                    data.accounts
+                      .filter((a) => selected.includes(a.id))
+                      .map((a) => a.platform),
+                  );
+                  const showOriginal = declareOriginalPlatforms.some(
+                    (platform) => selectedPlatforms.has(platform),
+                  );
+                  const showDouyinSync = selectedPlatforms.has("douyin");
+                  if (!showOriginal && !showDouyinSync) return null;
+                  return (
+                    <Form.Item label="发布选项">
+                      {showOriginal && (
+                        <div>
+                          <Checkbox
+                            checked={declareOriginal}
+                            onChange={(e) =>
+                              setDeclareOriginal(e.target.checked)
+                            }
+                          >
+                            声明原创
+                          </Checkbox>
+                          <Typography.Text
+                            type="secondary"
+                            style={{ marginLeft: 8 }}
+                          >
+                            勾选后在抖音、小红书、视频号发布时自动声明原创
+                          </Typography.Text>
+                        </div>
+                      )}
+                      {showDouyinSync && (
+                        <div style={showOriginal ? { marginTop: 8 } : undefined}>
+                          <span>抖音同步发布到：</span>
+                          <Checkbox.Group
+                            options={douyinSyncOptions}
+                            value={douyinSyncTargets}
+                            onChange={(values) =>
+                              setDouyinSyncTargets(
+                                values as DouyinSyncTarget[],
+                              )
+                            }
+                          />
+                          <Typography.Text
+                            type="secondary"
+                            style={{ marginLeft: 8 }}
+                          >
+                            需在抖音创作者中心绑定对应平台账号
+                          </Typography.Text>
+                        </div>
+                      )}
+                    </Form.Item>
+                  );
+                }}
               </Form.Item>
               <Button
                 type="primary"

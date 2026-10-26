@@ -18,6 +18,7 @@ export interface Account {
 }
 export type ContentType = "video" | "image_text";
 export type AccountSelections = Partial<Record<ContentType, string[]>>;
+export type DouyinSyncTarget = "toutiao" | "fanqie" | "dongchedi";
 export type TaskStatus =
   | "pending"
   | "opening"
@@ -35,6 +36,10 @@ export interface PublishDraft {
   mediaPaths: string[];
   coverPath?: string;
   accountIds: string[];
+  /** 抖音/小红书/视频号发布时勾选“声明原创” */
+  declareOriginal?: boolean;
+  /** 抖音发布时同步发送到的平台（需已在抖音绑定对应账号） */
+  douyinSyncTargets?: DouyinSyncTarget[];
   createdAt: string;
 }
 export interface PublishTask {

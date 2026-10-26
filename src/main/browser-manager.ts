@@ -1508,15 +1508,24 @@ export class BrowserManager {
         );
         await sleep(1200);
       }
+      // 声明类选项的勾选结果直接写进任务消息：用户能在界面上看到
+      // "原创已勾选"还是"未找到控件"，不再需要靠猜。
+      const declarationNotes: string[] = [];
       if (
         draft.declareOriginal &&
         ["douyin", "xiaohongshu", "weixin"].includes(account.platform)
       ) {
-        await this.ensureCheckboxByText(
+        const result = await this.ensureCheckboxByText(
           wc,
           [/声明原创/, /原创声明/, /原创/],
           "declare-original " + account.platform,
         );
+        if (result.ok && result.checked)
+          declarationNotes.push("已勾选声明原创");
+        else if (result.ok)
+          declarationNotes.push("声明原创开关已处于勾选状态");
+        else
+          declarationNotes.push("未找到声明原创控件（发布页可能需手动勾选）");
       }
       if (
         account.platform === "douyin" &&
@@ -1528,12 +1537,25 @@ export class BrowserManager {
           fanqie: /番茄/,
           dongchedi: /懂车帝/,
         };
-        for (const target of draft.douyinSyncTargets)
-          await this.ensureCheckboxByText(
+        const syncNames: Record<DouyinSyncTarget, string> = {
+          toutiao: "头条",
+          fanqie: "番茄",
+          dongchedi: "懂车帝",
+        };
+        for (const target of draft.douyinSyncTargets) {
+          const result = await this.ensureCheckboxByText(
             wc,
             [syncPatterns[target]],
             "douyin-sync " + target,
           );
+          declarationNotes.push(
+            result.ok && result.checked
+              ? `已勾选同步到${syncNames[target]}`
+              : result.ok
+                ? `同步到${syncNames[target]}已处于勾选状态`
+                : `未找到同步到${syncNames[target]}的控件`,
+          );
+        }
       }
       if (account.platform === "weixin") {
         // Install the request patch before the trusted mouse event. The page
@@ -1813,13 +1835,17 @@ export class BrowserManager {
         draft.title,
         180000,
       );
+      const declarationSuffix = declarationNotes.length
+        ? "；" + declarationNotes.join("、")
+        : "";
       if (verified.ok)
         return {
           status: "success" as const,
           message:
             platformMap[account.platform].name +
             "作品管理已找到目标标题，发布成功：" +
-            verified.url,
+            verified.url +
+            declarationSuffix,
         };
       if (result.success) {
         const evidence = await this.captureFailure(wc, account.platform).catch(
@@ -1829,6 +1855,7 @@ export class BrowserManager {
           status: "failed" as const,
           message:
             (verified.reason || "平台后台未找到目标作品") +
+            declarationSuffix +
             (evidence ? "；现场截图：" + evidence : ""),
         };
       }
@@ -1850,7 +1877,8 @@ export class BrowserManager {
             message:
               platformMap[account.platform].name +
               "作品管理已找到目标标题，发布成功：" +
-              lateVerified.url,
+              lateVerified.url +
+              declarationSuffix,
           };
       }
       const diagnostics =
@@ -2916,7 +2944,12 @@ export class BrowserManager {
     wc: Electron.WebContents,
     patterns: RegExp[],
     logTag: string,
-  ): Promise<void> {
+  ): Promise<{
+    ok: boolean;
+    checked?: boolean | null;
+    label?: string;
+    frame?: string;
+  }> {
     const frames = [wc.mainFrame, ...wc.mainFrame.framesInSubtree];
     const attempts: Array<Record<string, unknown>> = [];
     for (const frame of frames) {
@@ -2990,11 +3023,18 @@ export class BrowserManager {
       };
       attempts.push(record);
       await writeBrowserLog(logTag + " " + JSON.stringify(record));
-      if (result.ok) return;
+      if (result.ok)
+        return {
+          ok: true,
+          checked: result.after === true,
+          label: typeof result.label === "string" ? result.label : undefined,
+          frame: record.frame,
+        };
     }
     await writeBrowserLog(
       logTag + " no-visible-control " + JSON.stringify(attempts),
     );
+    return { ok: false };
   }
 
   private async waitAndClickButton(
@@ -3860,17 +3900,18 @@ export class BrowserManager {
               : { kind: "normalized", value: matchedNormalized },
             text: snapshot.text.slice(0, 16000),
           }));
-          if (platform === "xiaohongshu") {
-            // 原创声明取证：笔记管理列表页本身不展示"原创"字样（2026-10-26
-            // 实测：整页 2344 字符 0 次命中），无法据此判断声明是否生效。
-            // 真正的声明状态在笔记编辑页的"声明原创"开关上，因此改为进
-            // 编辑页读取该开关的 checked 状态作为权威证据。
-            const original = await this.readXhsOriginalDeclaration(
+          if (platform === "xiaohongshu" || platform === "douyin") {
+            // 原创声明取证：抖音内容管理页/小红书笔记管理页都不展示"原创"
+            // 字样（2026-10-26 实测两页"原创"均 0 次命中），靠列表判断无效。
+            // 真正的声明状态在作品/笔记编辑页的"声明原创"开关上，因此进
+            // 编辑页读取该开关的 checked 状态作为权威证据（只读，不保存）。
+            const original = await this.readOriginalDeclaration(
               wc,
+              platform,
               platformTitle,
             );
             await writeBrowserLog(
-              "xhs-original-declaration " + JSON.stringify(original),
+              "original-declaration " + JSON.stringify(original),
             );
           }
           return { ok: true, url: snapshot.url };
@@ -3894,27 +3935,39 @@ export class BrowserManager {
     };
   }
   /**
-   * 读取小红书笔记编辑页里"声明原创"开关的真实状态。
-   * 后台笔记管理列表页不展示"原创"字样（2026-10-26 实测整页 0 次命中），
-   * 因此判断声明是否生效只能进编辑页读开关。本方法只读不写：不点击保存、
-   * 不修改笔记，读完立即返回原页面。
+  /**
+   * 读取平台作品/笔记编辑页里"声明原创"开关的真实状态。
+   * 后台列表页不展示"原创"字样（2026-10-26 实测：抖音内容管理页 4624
+   * 字符、小红书笔记管理页 2344 字符，"原创"均 0 次命中），因此判断声明
+   * 是否生效只能进编辑页读开关。本方法只读不写：不点保存、不改内容，
+   * 读完立即返回原页面。抖音的"编辑作品"是弹窗、小红书是整页，两种
+   * 形态都要覆盖。
    */
-  private async readXhsOriginalDeclaration(
+  private async readOriginalDeclaration(
     wc: Electron.WebContents,
+    platform: Account["platform"],
     title: string,
   ): Promise<Record<string, unknown>> {
-    const result: Record<string, unknown> = { title };
+    const result: Record<string, unknown> = { platform, title };
     const backUrl = wc.getURL();
+    // 各平台编辑入口的文案：抖音"编辑作品"、小红书"编辑"、视频号"编辑"
+    const entryPattern =
+      platform === "douyin"
+        ? /^(编辑作品|编辑)$/
+        : platform === "weixin"
+          ? /^(编辑|编辑作品|编辑动态)$/
+          : /^(编辑|编辑笔记|编辑作品)$/;
     try {
-      // 在笔记管理页找到目标笔记的"编辑"入口并进入编辑页
+      // 在管理页找到目标作品的编辑入口并进入编辑页
       const opened = await wc
         .executeJavaScript(
           `(()=>{const visible=e=>!!e&&e.getClientRects&&e.getClientRects().length>0;
-            const rows=[...document.querySelectorAll('*')].filter(e=>visible(e)&&(e.textContent||'').trim()===${JSON.stringify(title)});
+            const title=${JSON.stringify(title)};
+            const rows=[...document.querySelectorAll('*')].filter(e=>visible(e)&&(e.textContent||'').trim()===title);
             for(const row of rows){
               let scope=row;
-              for(let i=0;i<6&&scope;i++){
-                const edit=[...scope.querySelectorAll('a,span,div,button')].find(e=>visible(e)&&/^(编辑|编辑笔记)$/.test((e.textContent||'').trim()));
+              for(let i=0;i<8&&scope;i++){
+                const edit=[...scope.querySelectorAll('a,span,div,button')].find(e=>visible(e)&&${JSON.stringify(entryPattern.source)}.split('|').map(p=>new RegExp('^(?:'+p+')$')).some(re=>re.test((e.textContent||'').trim())));
                 if(edit){const href=edit.closest('a')?.href||'';if(href)return href;(edit.closest('button')||edit).click();return 'clicked';}
                 scope=scope.parentElement;
               }
@@ -3923,29 +3976,40 @@ export class BrowserManager {
         )
         .catch(() => "");
       result.entry = opened;
-      if (opened === "clicked") await sleep(6000);
+      if (opened === "clicked") await sleep(8000);
       else if (opened) {
         await wc.loadURL(opened).catch(() => undefined);
-        await sleep(7000);
+        await sleep(8000);
       }
       result.url = wc.getURL();
-      const state = await wc
-        .executeJavaScript(
-          `(()=>{const visible=e=>!!e&&e.getClientRects&&e.getClientRects().length>0;
-            const labels=[...document.querySelectorAll('*')].filter(e=>visible(e)&&!/ /.test((e.textContent||'').trim())&&/原创/.test((e.textContent||'').trim())&&(e.textContent||'').trim().length<=12);
-            const out=labels.slice(0,6).map(l=>{
-              let scope=l;
-              for(let i=0;i<5&&scope;i++){
-                const c=scope.querySelector&&scope.querySelector('input[type=checkbox],[role=switch],[class*=switch],[class*=checkbox]');
-                if(c)return{label:(l.textContent||'').trim(),checked:c.checked!==undefined?!!c.checked:(c.getAttribute('aria-checked')==='true'),tag:c.tagName,cls:String(c.className||'').slice(0,100),html:(c.outerHTML||'').slice(0,220)};
-                scope=scope.parentElement;
-              }
-              return{label:(l.textContent||'').trim(),checked:null,html:(l.outerHTML||'').slice(0,220)};
-            });
-            return{labels:out,bodyHasOriginal:/声明原创|原创声明|标记为原创/.test(document.body?.innerText||'')};})()`,
-        )
-        .catch((error) => ({ error: String(error) }));
-      result.state = state;
+      // 抖音的"编辑作品"是弹窗、小红书是整页：主 frame + 全部子 frame 一起扫
+      const stateScript = `(()=>{const visible=e=>!!e&&e.getClientRects&&e.getClientRects().length>0;
+        const labels=[...document.querySelectorAll('*')].filter(e=>visible(e)&&!/ /.test((e.textContent||'').trim())&&/原创/.test((e.textContent||'').trim())&&(e.textContent||'').trim().length<=12);
+        const out=labels.slice(0,8).map(l=>{
+          let scope=l;
+          for(let i=0;i<5&&scope;i++){
+            const c=scope.querySelector&&scope.querySelector('input[type=checkbox],[role=switch],[class*=switch],[class*=checkbox]');
+            if(c)return{label:(l.textContent||'').trim(),checked:c.checked!==undefined?!!c.checked:(c.getAttribute('aria-checked')==='true'),tag:c.tagName,cls:String(c.className||'').slice(0,100),html:(c.outerHTML||'').slice(0,220)};
+            scope=scope.parentElement;
+          }
+          return{label:(l.textContent||'').trim(),checked:null,html:(l.outerHTML||'').slice(0,220)};
+        });
+        const body=(document.body?.innerText||'');
+        return{url:location.href,labels:out,bodyHasOriginal:/声明原创|原创声明|标记为原创|作品声明/.test(body),snippet:body.split('\\n').filter(line=>/原创|声明/.test(line)).slice(0,12)};})()`;
+      const frames = [wc.mainFrame, ...wc.mainFrame.framesInSubtree];
+      const states = await Promise.all(
+        frames.map((frame) =>
+          frame
+            .executeJavaScript(stateScript)
+            .catch((error) => ({ error: String(error) })),
+        ),
+      );
+      const merged = states.filter(
+        (item: any) => item && (item.labels?.length || item.bodyHasOriginal),
+      );
+      result.state = merged.length
+        ? merged
+        : { note: "编辑页未发现原创相关控件", frames: states.length };
     } catch (error) {
       result.error = String(error);
     } finally {

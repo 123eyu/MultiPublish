@@ -282,6 +282,42 @@ export class BrowserManager {
       string,
       { method: string; url: string }
     >();
+    // 抖音发布链路曾有"点击后跳转管理页但作品从未落库"的哑弹（URL 跳转
+    // 不代表提交成功），挂 Network 监听把发布相关 API 的真实响应状态留痕。
+    let douyinNetworkListener:
+      | ((_event: Electron.Event, method: string, params: any) => void)
+      | undefined;
+    if (account.platform === "douyin") {
+      try {
+        if (!wc.debugger.isAttached()) await wc.debugger.attach("1.3");
+        await wc.debugger.sendCommand("Network.enable");
+        douyinNetworkListener = (_event, method, params) => {
+          if (method !== "Network.responseReceived") return;
+          const response = (
+            params as { response?: { url?: string; status?: number } }
+          ).response;
+          if (!response?.url) return;
+          if (
+            !/(publish|aweme\/v1\/(video|post)|creator\/content)/i.test(
+              response.url,
+            )
+          )
+            return;
+          void writeBrowserLog(
+            "douyin-network " +
+              JSON.stringify({
+                status: response.status,
+                url: response.url.slice(0, 300),
+              }),
+          );
+        };
+        wc.debugger.on("message", douyinNetworkListener);
+      } catch (error) {
+        await writeBrowserLog(
+          "douyin-network-listener-failed " + String(error),
+        );
+      }
+    }
     try {
       await progress(
         "opening",
@@ -1624,6 +1660,21 @@ export class BrowserManager {
             "(()=>JSON.stringify({url:location.href,publishButtons:[...document.querySelectorAll('button')].filter(button=>(button.textContent||'').trim()==='发布').map(button=>({disabled:!!button.disabled,ariaDisabled:button.getAttribute('aria-disabled'),visible:!!button.offsetParent,html:(button.outerHTML||'').slice(0,800)}))}))()",
           )
           .catch((error) => String(error));
+        // 点击现场落盘：跳转成功与否、按钮状态、平台拦截提示都要可追溯。
+        await writeBrowserLog(
+          "douyin-publish-click " +
+            JSON.stringify({ clicked, url: wc.getURL() }) +
+            (clickDiagnostics ? " " + clickDiagnostics.slice(0, 6000) : ""),
+        );
+        await sleep(4000);
+        const douyinToasts = await wc
+          .executeJavaScript(
+            "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0;return [...document.querySelectorAll('div,span,p')].filter(visible).map(e=>(e.textContent||'').trim()).filter(t=>t&&t.length<80&&/失败|错误|审核|违规|频繁|请先|不能|稍后/.test(t)).slice(-12)})()",
+          )
+          .catch(() => []);
+        await writeBrowserLog(
+          "douyin-post-click-toasts " + JSON.stringify(douyinToasts),
+        );
       } else if (account.platform === "bilibili") {
         await sleep(15000);
         clickDiagnostics = await wc
@@ -1825,6 +1876,12 @@ export class BrowserManager {
       this.weixinPostListTitles.delete(wc.id);
       if (weixinDiagnosticListener)
         wc.debugger.removeListener("message", weixinDiagnosticListener);
+      if (douyinNetworkListener) {
+        wc.debugger.removeListener("message", douyinNetworkListener);
+        await wc.debugger
+          .sendCommand("Network.disable")
+          .catch(() => undefined);
+      }
       await this.flushAccountSession(account.id, "publish-finished");
       if (!automationWindow.isDestroyed()) automationWindow.destroy();
     }
@@ -3674,15 +3731,20 @@ export class BrowserManager {
             reason: platformMap[platform].name + "作品管理要求重新登录",
           };
         const normalizedText = normalize(snapshot.text);
-        if (
-          rawExpected.some((value) => snapshot.text.includes(value)) ||
-          (platform === "weixin"
-            ? normalizedText.includes(normalizedTitle)
-            : expected.some((value) => normalizedText.includes(value)))
-        ) {
+        const matchedRaw = rawExpected.find((value) =>
+          snapshot.text.includes(value),
+        );
+        const matchedNormalized = matchedRaw
+          ? undefined
+          : expected.find((value) => normalizedText.includes(value));
+        if (matchedRaw || matchedNormalized) {
           await writeBrowserLog("backend-title-verified " + JSON.stringify({
             platform, title: platformTitle, url: snapshot.url,
-            source: "manager-dom", text: snapshot.text.slice(0, 16000),
+            source: "manager-dom",
+            matched: matchedRaw
+              ? { kind: "raw", value: matchedRaw }
+              : { kind: "normalized", value: matchedNormalized },
+            text: snapshot.text.slice(0, 16000),
           }));
           return { ok: true, url: snapshot.url };
         }

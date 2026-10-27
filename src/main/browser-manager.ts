@@ -3063,8 +3063,11 @@ export class BrowserManager {
           const aria=el.getAttribute&&el.getAttribute('aria-checked');
           if(aria==='true'||aria==='false')return aria==='true';
           const cls=String(el.className||'');
+          // 注意："unchecked" 包含 "checked" 子串，必须先排除
+          // （22:16 批次实证：d-switch-simulator unchecked 被误读为已勾选）
+          if(/(^|[\s-])unchecked([\s-]|$)/i.test(cls))return false;
           if(/checked|switched|is-on|is-active|active|selected|opened/i.test(cls))return true;
-          const inner=el.querySelector&&el.querySelector('[class*=checked],[class*=switched],[class*=active],[class*=selected]');
+          const inner=el.querySelector&&el.querySelector('[class*=checked]:not([class*=unchecked])');
           if(inner)return true;
           return null;
         };
@@ -3140,6 +3143,28 @@ export class BrowserManager {
       }
       // 阶段二：点击。优先用真实鼠标事件（Input.dispatchMouseEvent），
       // 平台自绘的 switch/卡片只响应 trusted 事件，el.click() 会被忽略。
+      // 必须先 scrollIntoView：声明开关常在视口之外（22:16 批次实证：
+      // 开关 y≈1108 超出视口高度，未滚动时 CDP 点击坐标落空，class
+      // 点击后依然是 unchecked）。
+      await frame
+        .executeJavaScript(
+          `(()=>{const el=document.querySelector('[${mark}="1"]');if(!el)return false;el.scrollIntoView({block:'center'});return true})()`,
+        )
+        .catch(() => false);
+      await sleep(600);
+      // 子 frame 的元素坐标是 frame 内坐标系，CDP 鼠标事件用主视口坐标，
+      // 需要加上 iframe 在主页面里的偏移（抖音声明控件在 iframe 内）
+      let frameOffset = { ox: 0, oy: 0 };
+      if (frame !== wc.mainFrame) {
+        const offset = (await wc.mainFrame
+          .executeJavaScript(
+            `(()=>{const url=${JSON.stringify(frame.url.slice(0, 120))};
+              const ifr=[...document.querySelectorAll('iframe')].find(f=>(f.src||'')===url||(f.src||'').split('?')[0]===url.split('?')[0]);
+              if(!ifr)return null;const r=ifr.getBoundingClientRect();return{ox:Math.round(r.left),oy:Math.round(r.top)};})()`,
+          )
+          .catch(() => undefined)) as { ox: number; oy: number } | undefined;
+        if (offset) frameOffset = offset;
+      }
       const clickInfo = (await frame
         .executeJavaScript(
           `(()=>{const el=document.querySelector('[${mark}="1"]');if(!el)return null;
@@ -3155,13 +3180,13 @@ export class BrowserManager {
           if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
           await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
             type: "mouseMoved",
-            x: clickInfo.x,
-            y: clickInfo.y,
+            x: clickInfo.x + frameOffset.ox,
+            y: clickInfo.y + frameOffset.oy,
           });
           await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
             type: "mousePressed",
-            x: clickInfo.x,
-            y: clickInfo.y,
+            x: clickInfo.x + frameOffset.ox,
+            y: clickInfo.y + frameOffset.oy,
             button: "left",
             buttons: 1,
             clickCount: 1,
@@ -3169,8 +3194,8 @@ export class BrowserManager {
           await sleep(120);
           await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
             type: "mouseReleased",
-            x: clickInfo.x,
-            y: clickInfo.y,
+            x: clickInfo.x + frameOffset.ox,
+            y: clickInfo.y + frameOffset.oy,
             button: "left",
             buttons: 0,
             clickCount: 1,
@@ -3199,8 +3224,9 @@ export class BrowserManager {
               const aria=el.getAttribute&&el.getAttribute('aria-checked');
               if(aria==='true'||aria==='false')return aria==='true';
               const cls=String(el.className||'');
+              if(/(^|[\s-])unchecked([\s-]|$)/i.test(cls))return false;
               if(/checked|switched|is-on|is-active|active|selected|opened/i.test(cls))return true;
-              const inner=el.querySelector&&el.querySelector('[class*=checked],[class*=switched],[class*=active],[class*=selected]');
+              const inner=el.querySelector&&el.querySelector('[class*=checked]:not([class*=unchecked])');
               if(inner)return true;
               return null;
             };

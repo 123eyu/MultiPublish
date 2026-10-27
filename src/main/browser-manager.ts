@@ -3081,8 +3081,28 @@ export class BrowserManager {
           for(const root of containers){
             const real=root.querySelector&&root.querySelector('input[type=checkbox],input[type=radio],[role=switch],[role=checkbox]');
             if(real){
-              real.setAttribute('${mark}','1');
-              return{ok:true,kind:'control',label,tag:real.tagName,cls:String(real.className||'').slice(0,140),html:(real.outerHTML||'').slice(0,320),state:stateOf(real),disabled:!!real.disabled,scopeText:((root.innerText||root.textContent)||'').trim().slice(0,120),rootHtml:(root.outerHTML||'').slice(0,600)};
+              const r=real.getBoundingClientRect();
+              // 隐藏 input（0 尺寸）是自定义 switch 的数据载体，真实用户点的是
+              // 可视开关容器。React 受控组件通常把 onChange 绑在容器上，
+              // 直接 click 隐藏 input 可能不触发框架状态更新
+              // （2026-10-26 23:07 实证：input checked 变 true 但发布请求体无原创字段）。
+              if(r.width>0&&r.height>0&&visible(real)){
+                real.setAttribute('${mark}','1');
+                return{ok:true,kind:'control',label,tag:real.tagName,cls:String(real.className||'').slice(0,140),html:(real.outerHTML||'').slice(0,320),state:stateOf(real),disabled:!!real.disabled,scopeText:((root.innerText||root.textContent)||'').trim().slice(0,120),rootHtml:(root.outerHTML||'').slice(0,600)};
+              }
+              // 找隐藏 input 的可视宿主：先向上找带 switch/checkbox 样式的容器，
+              // 再退回"包含 input 的最小可见祖先"
+              let host=real.parentElement;
+              let hostEl=null;
+              for(let i=0;i<4&&host;i++){
+                if(/switch|checkbox|toggle/i.test(String(host.className||''))&&visible(host)){hostEl=host;break}
+                const hr=host.getBoundingClientRect();
+                if(hr.width>0&&hr.height>0&&visible(host)&&hr.width<420&&hr.height<90){hostEl=host}
+                host=host.parentElement;
+              }
+              const target=hostEl||real;
+              target.setAttribute('${mark}','1');
+              return{ok:true,kind:'control-hidden-input',label,tag:target.tagName,cls:String(target.className||'').slice(0,140),html:(target.outerHTML||'').slice(0,320),state:stateOf(target),disabled:!!real.disabled,inputVisible:false,scopeText:((root.innerText||root.textContent)||'').trim().slice(0,120),rootHtml:(root.outerHTML||'').slice(0,600)};
             }
             const cands=[...(root.querySelectorAll?root.querySelectorAll('[class*=switch],[class*=checkbox],[class*=toggle],[role=switch]'):[])].filter(isControl);
             for(const c of cands){
